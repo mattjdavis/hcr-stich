@@ -517,6 +517,7 @@ def analyze_adjacent_pairs(pairs, tile_names, transforms):
     
     return stats
 
+
 def extract_x_y_z_transforms(transforms):
     """
     Extract x, y, z transforms from a dictionary of transforms
@@ -527,6 +528,7 @@ def extract_x_y_z_transforms(transforms):
     z_transforms = [t[2, 3] for t in transform]
 
     return x_transforms, y_transforms, z_transforms
+
 
 def analyze_outlier_pairs(pairs, tile_names, transforms, threshold=None):
     """
@@ -607,6 +609,7 @@ def analyze_outlier_pairs(pairs, tile_names, transforms, threshold=None):
     
     return outliers
 
+
 def plot_transform_differences_histogram(stats, bins=50):
 
     """
@@ -642,10 +645,12 @@ def plot_transform_differences_histogram(stats, bins=50):
     plt.tight_layout()
     plt.show()
 
-def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, bucket_name, dataset_path, 
-                          z_slice=None, pyramid_level=0, save=False, output_dir=None):
+
+def get_transformed_tile_pair(tile1_name, tile2_name, transforms, tile_names, 
+                              bucket_name, dataset_path, 
+                             z_slice=None, pyramid_level=0):
     """
-    Plot a z-slice through two adjacent tiles in their transformed positions.
+    Get a z-slice through two adjacent tiles in their transformed positions.
     Transforms are relative to (0,0) at the center of the nominal grid.
     Z-transform is applied before selecting the slice.
     
@@ -657,8 +662,11 @@ def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, buck
         dataset_path: Path to dataset in bucket
         z_slice: Z-slice to display
         pyramid_level: Pyramid level to load
-        save: Whether to save the plot
-        output_dir: Directory to save plot if save=True
+        
+    Returns:
+        combined: Combined image array
+        extent: [x_min, x_max, y_min, y_max] for plotting
+        z_slice: The z-slice that was used
     """
     # Get indices and transforms
     idx1 = list(tile_names.keys())[list(tile_names.values()).index(tile1_name)]
@@ -674,9 +682,6 @@ def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, buck
     scale = int(2**pyramid_level)
     z_offset1 = int(round(t1[2, 3] / scale))  # Get Z offset from transform
     z_offset2 = int(round(t2[2, 3] / scale))  # Get Z offset from transform
-    
-    print(f"Z offset 1: {z_offset1}")
-    print(f"Z offset 2: {z_offset2}")
     
     # Pad or crop the data based on z offsets
     max_z = max(tile1_data.shape[2] + abs(z_offset1), tile2_data.shape[2] + abs(z_offset2))
@@ -765,35 +770,53 @@ def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, buck
     # Clip to ensure we don't exceed 1.0
     combined = np.clip(combined, 0, 1)
     
+    # Return the combined image and extent for plotting
+    extent = [x_min, x_max, y_min, y_max]
+    
+    return combined, extent, z_slice
+
+def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, bucket_name, dataset_path, 
+                          z_slice=None, pyramid_level=0, save=False, output_dir=None):
+    """
+    Plot a z-slice through two adjacent tiles in their transformed positions.
+    Transforms are relative to (0,0) at the center of the nominal grid.
+    Z-transform is applied before selecting the slice.
+    
+    Args:
+        tile1_name, tile2_name: Names of tiles to compare
+        transforms: Dictionary mapping tile IDs to transformation matrices
+        tile_names: Dictionary mapping tile IDs to tile names
+        bucket_name: S3 bucket name
+        dataset_path: Path to dataset in bucket
+        z_slice: Z-slice to display
+        pyramid_level: Pyramid level to load
+        save: Whether to save the plot
+        output_dir: Directory to save plot if save=True
+    """
+    # Get the transformed and combined tile data
+    combined, extent, z_slice = get_transformed_tile_pair(
+        tile1_name, tile2_name, transforms, tile_names,
+        bucket_name, dataset_path, z_slice, pyramid_level
+    )
+    
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax = fig.add_subplot(111)
     ax.set_facecolor('black')
-
     
     # Plot combined image
-    ax.imshow(combined, extent=[x_min, x_max, y_min, y_max])
+    ax.imshow(combined, extent=extent)
     
     # Add tile information
     pos1 = parse_tile_name(tile1_name)
     pos2 = parse_tile_name(tile2_name)
     ax.set_title(f'Tile Pair Comparison\nRed: {pos1} | Green: {pos2} | Yellow: Overlap\nZ-slice: {z_slice}')
     
-    # # Add grid and center marker
-    # ax.grid(True, alpha=0.3)
-    # ax.axhline(y=0, color='white', linestyle='--', alpha=0.5)
-    # ax.axvline(x=0, color='white', linestyle='--', alpha=0.5)
-    # ax.plot(0, 0, 'w+', markersize=10, label='Grid Center (0,0)')
-    
     # Set axis limits with padding
-    padding = 0.05  # 10% padding
-    x_range = x_max - x_min
-    y_range = y_max - y_min
-    ax.set_xlim(x_min - x_range * padding, x_max + x_range * padding)
-    ax.set_ylim(y_min - y_range * padding, y_max + y_range * padding)
-    
-    # Add legend
-    #ax.legend()
+    padding = 0.05  # 5% padding
+    x_range = extent[1] - extent[0]
+    y_range = extent[3] - extent[2]
+    ax.set_xlim(extent[0] - x_range * padding, extent[1] + x_range * padding)
+    ax.set_ylim(extent[2] - y_range * padding, extent[3] + y_range * padding)
     
     if save and output_dir:
         output_path = Path(output_dir) / f'tile_pair_{tile1_name}_{tile2_name}_z{z_slice}.png'
@@ -839,6 +862,7 @@ def plot_all_adjacent_pairs(pairs, transforms, tile_names, bucket_name, dataset_
 def load_tile_data(tile_name, bucket_name, dataset_path, pyramid_level=0,dims_order=(1,2,0)):
     """
     Load tile data from zarr
+    (1,2,0) is the order of the dimensions in the zarr file
     """
     tile_array_loc = f"{dataset_path}{tile_name}/{pyramid_level}"
     zarr_path = f"s3://{bucket_name}/{tile_array_loc}"
@@ -1110,3 +1134,580 @@ def plot_tile_orthogonal_views(tile_data, tile_name,
         plt.show()
         
     return fig, (ax_xy, ax_xz, ax_yz)
+
+def calculate_accutance(image_slice, percentile_threshold=99):
+    """
+    Calculate accutance (edge sharpness) for an image slice.
+    Uses Sobel operator to detect edges and measures their strength.
+    
+    Args:
+        image_slice: 2D numpy array containing the image slice
+        percentile_threshold: Percentile threshold for edge detection (default 99)
+        
+    Returns:
+        dict containing:
+            mean_accutance: Mean edge strength
+            max_accutance: Maximum edge strength
+            accutance_map: 2D array of edge strengths
+            edge_mask: Boolean mask of detected edges
+    """
+    from scipy import ndimage
+    
+    # Normalize image to [0,1]
+    img_norm = image_slice.astype(float)
+    if img_norm.max() > 0:
+        img_norm = img_norm / img_norm.max()
+    
+    # Calculate gradients using Sobel operator
+    grad_x = ndimage.sobel(img_norm, axis=1)
+    grad_y = ndimage.sobel(img_norm, axis=0)
+    
+    # Calculate gradient magnitude
+    accutance_map = np.sqrt(grad_x**2 + grad_y**2)
+    
+    # Create edge mask using threshold
+    edge_threshold = np.percentile(accutance_map, percentile_threshold)
+    edge_mask = accutance_map > edge_threshold
+    
+    # Calculate statistics for detected edges
+    edge_values = accutance_map[edge_mask]
+    mean_accutance = edge_values.mean() if edge_values.size > 0 else 0
+    max_accutance = edge_values.max() if edge_values.size > 0 else 0
+    
+    return {
+        'mean_accutance': mean_accutance,
+        'max_accutance': max_accutance,
+        'accutance_map': accutance_map,
+        'edge_mask': edge_mask
+    }
+
+def plot_accutance_profile(tile_data, axis='z', slice_range=None, step=1):
+    """
+    Plot accutance profile along specified axis.
+    
+    Args:
+        tile_data: 3D numpy array (z,y,x)
+        axis: Axis along which to calculate profile ('z', 'y', or 'x')
+        slice_range: Tuple of (start, end) indices. If None, uses full range
+        step: Step size for sampling slices (default 1)
+        
+    Returns:
+        fig: Figure object
+        ax: Axes object
+        profile: Dict containing accutance values and positions
+    """
+    # Set up axis mapping
+    axis_map = {'z': 0, 'y': 1, 'x': 2}
+    axis_idx = axis_map[axis]
+    
+    # Determine slice range
+    if slice_range is None:
+        slice_range = (0, tile_data.shape[axis_idx])
+    
+    # Initialize arrays for profile
+    positions = range(slice_range[0], slice_range[1], step)
+    mean_accutance = []
+    max_accutance = []
+    
+    # Calculate accutance for each slice
+    for pos in positions:
+        # Take slice along specified axis
+        if axis == 'z':
+            slice_data = tile_data[pos, :, :]
+        elif axis == 'y':
+            slice_data = tile_data[:, pos, :]
+        else:  # x
+            slice_data = tile_data[:, :, pos]
+            
+        # Calculate accutance
+        acc = calculate_accutance(slice_data)
+        mean_accutance.append(acc['mean_accutance'])
+        max_accutance.append(acc['max_accutance'])
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(positions, mean_accutance, label='Mean Accutance', color='blue')
+    ax.plot(positions, max_accutance, label='Max Accutance', color='red', alpha=0.5)
+    
+    ax.set_xlabel(f'{axis.upper()} Position')
+    ax.set_ylabel('Accutance')
+    ax.set_title(f'Accutance Profile Along {axis.upper()} Axis')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    profile = {
+        'positions': positions,
+        'mean_accutance': mean_accutance,
+        'max_accutance': max_accutance
+    }
+    
+    return fig, ax, profile
+
+def plot_accutance_comparison(tile1_data, tile2_data, axis='z', slice_range=None, step=1):
+    """
+    Plot accutance profiles for two tiles side by side.
+    
+    Args:
+        tile1_data, tile2_data: 3D numpy arrays (z,y,x)
+        axis: Axis along which to calculate profile ('z', 'y', or 'x')
+        slice_range: Tuple of (start, end) indices. If None, uses full range
+        step: Step size for sampling slices (default 1)
+        
+    Returns:
+        fig: Figure object
+        axes: List of axes objects
+        profiles: Dict containing accutance profiles for both tiles
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Calculate and plot profiles
+    _, _, profile1 = plot_accutance_profile(tile1_data, axis, slice_range, step)
+    _, _, profile2 = plot_accutance_profile(tile2_data, axis, slice_range, step)
+    
+    # Plot on first axis
+    ax1.plot(profile1['positions'], profile1['mean_accutance'], 
+             label='Tile 1 Mean', color='blue')
+    ax1.plot(profile1['positions'], profile1['max_accutance'], 
+             label='Tile 1 Max', color='blue', alpha=0.5)
+    ax1.plot(profile2['positions'], profile2['mean_accutance'], 
+             label='Tile 2 Mean', color='red')
+    ax1.plot(profile2['positions'], profile2['max_accutance'], 
+             label='Tile 2 Max', color='red', alpha=0.5)
+    
+    ax1.set_xlabel(f'{axis.upper()} Position')
+    ax1.set_ylabel('Accutance')
+    ax1.set_title('Accutance Profiles Comparison')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot difference on second axis
+    mean_diff = np.array(profile1['mean_accutance']) - np.array(profile2['mean_accutance'])
+    max_diff = np.array(profile1['max_accutance']) - np.array(profile2['max_accutance'])
+    
+    ax2.plot(profile1['positions'], mean_diff, label='Mean Difference', color='green')
+    ax2.plot(profile1['positions'], max_diff, label='Max Difference', color='green', alpha=0.5)
+    ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+    
+    ax2.set_xlabel(f'{axis.upper()} Position')
+    ax2.set_ylabel('Accutance Difference')
+    ax2.set_title('Accutance Difference (Tile 1 - Tile 2)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    profiles = {
+        'tile1': profile1,
+        'tile2': profile2,
+        'difference': {
+            'positions': profile1['positions'],
+            'mean_difference': mean_diff,
+            'max_difference': max_diff
+        }
+    }
+    
+    return fig, [ax1, ax2], profiles
+
+def calculate_block_accutance_profiles(tile_data, n_blocks=3, axis='z', slice_range=None, step=1):
+    """
+    Calculate accutance profiles for each block in an nxn grid of the tile.
+    
+    Args:
+        tile_data: 3D numpy array (z,y,x)
+        n_blocks: Number of blocks in each dimension (default 3 for 3x3 grid)
+        axis: Axis along which to calculate profile ('z', 'y', or 'x')
+        slice_range: Tuple of (start, end) indices. If None, uses full range
+        step: Step size for sampling slices (default 1)
+        
+    Returns:
+        profiles: Dict containing accutance profiles for each block
+        block_bounds: Dict containing block boundaries
+    """
+    # Get dimensions
+    z_dim, y_dim, x_dim = tile_data.shape
+    
+    # Calculate block sizes
+    y_block_size = y_dim // n_blocks
+    x_block_size = x_dim // n_blocks
+    
+    # Calculate block boundaries
+    y_bounds = [(i * y_block_size, (i + 1) * y_block_size) for i in range(n_blocks)]
+    x_bounds = [(i * x_block_size, (i + 1) * x_block_size) for i in range(n_blocks)]
+    
+    # Set up axis mapping
+    axis_map = {'z': 0, 'y': 1, 'x': 2}
+    axis_idx = axis_map[axis]
+    
+    # Determine slice range
+    if slice_range is None:
+        slice_range = (0, tile_data.shape[axis_idx])
+    
+    # Initialize arrays for profiles
+    positions = range(slice_range[0], slice_range[1], step)
+    profiles = {}
+    
+    # Calculate accutance for each block
+    for i in range(n_blocks):
+        for j in range(n_blocks):
+            block_id = f'block_{i}_{j}'
+            y_start, y_end = y_bounds[i]
+            x_start, x_end = x_bounds[j]
+            
+            mean_accutance = []
+            max_accutance = []
+            
+            # Calculate accutance for each slice
+            for pos in positions:
+                if axis == 'z':
+                    slice_data = tile_data[pos, y_start:y_end, x_start:x_end]
+                elif axis == 'y':
+                    slice_data = tile_data[:, pos, x_start:x_end]
+                else:  # x
+                    slice_data = tile_data[:, x_start:x_end, pos]
+                
+                acc = calculate_accutance(slice_data)
+                mean_accutance.append(acc['mean_accutance'])
+                max_accutance.append(acc['max_accutance'])
+            
+            profiles[block_id] = {
+                'positions': positions,
+                'mean_accutance': mean_accutance,
+                'max_accutance': max_accutance,
+                'bounds': {
+                    'y': (y_start, y_end),
+                    'x': (x_start, x_end)
+                }
+            }
+    
+    block_bounds = {
+        'y': y_bounds,
+        'x': x_bounds
+    }
+    
+    return profiles, block_bounds
+
+def plot_block_accutance_profiles(tile_data, tile_name=None, n_blocks=3, axis='z', 
+                                slice_range=None, step=1, plot_max=False):
+    """
+    Plot accutance profiles for each block in an nxn grid of the tile.
+    
+    Args:
+        tile_data: 3D numpy array (z,y,x)
+        tile_name: Name of tile for title (optional)
+        n_blocks: Number of blocks in each dimension (default 3 for 3x3 grid)
+        axis: Axis along which to calculate profile ('z', 'y', or 'x')
+        slice_range: Tuple of (start, end) indices. If None, uses full range
+        step: Step size for sampling slices (default 1)
+        plot_max: Whether to plot max accutance (default False, plots mean)
+        
+    Returns:
+        fig: Figure object
+        ax: Axes object
+        profiles: Dict containing accutance profiles for each block
+    """
+    # Calculate profiles for each block
+    profiles, block_bounds = calculate_block_accutance_profiles(
+        tile_data, n_blocks, axis, slice_range, step
+    )
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Plot profiles for each block with different colors
+    colors = plt.cm.viridis(np.linspace(0, 1, n_blocks * n_blocks))
+    
+    for idx, (block_id, profile) in enumerate(profiles.items()):
+        i, j = map(int, block_id.split('_')[1:])
+        label = f'Block ({i},{j})'
+        
+        if plot_max:
+            ax.plot(profile['positions'], profile['max_accutance'], 
+                   label=label, color=colors[idx], alpha=0.7)
+        else:
+            ax.plot(profile['positions'], profile['mean_accutance'], 
+                   label=label, color=colors[idx], alpha=0.7)
+    
+    # Add labels and title
+    ax.set_xlabel(f'{axis.upper()} Position')
+    ax.set_ylabel('Accutance')
+    title = f'Block Accutance Profiles Along {axis.upper()} Axis'
+    if tile_name:
+        pos = parse_tile_name(tile_name)
+        title += f'\nTile {pos}'
+    if plot_max:
+        title += ' (Maximum Values)'
+    else:
+        title += ' (Mean Values)'
+    ax.set_title(title)
+    
+    # Add legend
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    # Adjust layout to prevent legend cutoff
+    plt.tight_layout()
+    
+    return fig, ax, profiles
+
+def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_threshold=99):
+    """
+    Plot a heatmap of accutance values for each block in an nxn grid at a specific z-slice,
+    alongside the original image slice with grid overlay.
+    
+    Args:
+        tile_data: 3D numpy array (x,y,z)
+        z_slice: Z-slice index to analyze
+        n_blocks: Number of blocks in each dimension (default 3 for 3x3 grid)
+        percentile_threshold: Threshold for edge detection
+        
+    Returns:
+        fig: Figure object
+        axes: List of axes objects [ax_image, ax_heatmap]
+        accutance_values: 2D array of accutance values
+    """
+    # Get dimensions
+    x_dim, y_dim, _ = tile_data.shape
+    
+    # Calculate block sizes
+    y_block_size = y_dim // n_blocks
+    x_block_size = x_dim // n_blocks
+    
+    # Initialize array for accutance values
+    accutance_values = np.zeros((n_blocks, n_blocks))
+    
+    # Calculate accutance for each block
+    for i in range(n_blocks):
+        for j in range(n_blocks):
+            y_start = i * y_block_size
+            y_end = (i + 1) * y_block_size
+            x_start = j * x_block_size
+            x_end = (j + 1) * x_block_size
+            
+            block_data = tile_data[x_start:x_end, y_start:y_end, z_slice]
+            acc = calculate_accutance(block_data, percentile_threshold)
+            accutance_values[i, j] = acc['mean_accutance']
+    
+    # Create figure with two subplots
+    fig, (ax_image, ax_heatmap) = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Plot original image
+    image_slice = tile_data[:,:,z_slice]
+    im_image = ax_image.imshow(image_slice, cmap='gray')
+    ax_image.set_title(f'Original Image\nZ-slice {z_slice}')
+    
+    # Add grid lines to original image
+    for i in range(1, n_blocks):
+        ax_image.axhline(y=i * y_block_size, color='r', linestyle='--', alpha=0.5)
+        ax_image.axvline(x=i * x_block_size, color='r', linestyle='--', alpha=0.5)
+    
+    # Add block numbers to original image
+    # for i in range(n_blocks):
+    #     for j in range(n_blocks):
+    #         center_y = (i + 0.5) * y_block_size
+    #         center_x = (j + 0.5) * x_block_size
+    #         ax_image.text(center_x, center_y, f'({i},{j})', 
+    #                     ha='center', va='center', 
+    #                     color='red', fontweight='bold',
+    #                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+    
+    # Plot heatmap
+    im_heatmap = ax_heatmap.imshow(accutance_values, cmap='viridis')
+    ax_heatmap.set_title('Accutance Heatmap')
+    
+    # Add colorbar to heatmap
+    plt.colorbar(im_heatmap, ax=ax_heatmap, label='Mean Accutance')
+    
+    # Add block labels to heatmap
+    for i in range(n_blocks):
+        for j in range(n_blocks):
+            text = f'{accutance_values[i, j]:.3f}'
+            ax_heatmap.text(j, i, text, ha='center', va='center', 
+                          color='white', fontweight='bold')
+    
+    # Add labels to heatmapS
+    ax_heatmap.set_xticks(range(n_blocks))
+    ax_heatmap.set_yticks(range(n_blocks))
+    ax_heatmap.set_xlabel('X Block')
+    ax_heatmap.set_ylabel('Y Block')
+    
+    # Add grid lines to heatmap
+    ax_heatmap.grid(True, color='white', linestyle='-', alpha=0.2)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    return fig, [ax_image, ax_heatmap], accutance_values
+
+####
+# All tiles accutance
+####
+def calculate_tile_grid_block_accutance(tile_dict, bucket_name, dataset_path,
+                                      z_slice, n_blocks=3, pyramid_level=0, percentile_threshold=99):
+    """
+    Calculate accutance values for 3x3 blocks within each tile across the entire tile grid.
+    
+    Args:
+        tile_dict: Dictionary mapping tile IDs to tile names
+        transforms: Dictionary mapping tile IDs to transformation matrices
+        tile_names: Dictionary mapping tile IDs to tile names
+        bucket_name: S3 bucket name
+        dataset_path: Path to dataset in bucket
+        z_slice: Z-slice to analyze
+        n_blocks: Number of blocks per tile dimension (default 3)
+        pyramid_level: Pyramid level to load
+        percentile_threshold: Threshold for edge detection
+        
+    Returns:
+        dict containing:
+            grid_accutance: 2D array of shape (grid_y * n_blocks, grid_x * n_blocks) with accutance values
+            tile_positions: Dictionary mapping tile IDs to their grid positions
+            coverage_map: 2D boolean array showing tile presence
+    """
+    # First analyze the tile grid to get dimensions and positions
+    grid_info = analyze_tile_grid(tile_dict, plot=False)
+    grid_x, grid_y = grid_info['dimensions'][:2]
+    coverage_map = grid_info['coverage_map']
+    
+    # Initialize the full accutance grid
+    full_grid = np.full((grid_y * n_blocks, grid_x * n_blocks), np.nan)
+    
+    # Process each tile
+    for tile_id, tile_name in tile_dict.items():
+        print(f'Processing tile {tile_name}')
+        # Extract tile position from name
+        parts = tile_name.split('_')
+        tile_x = int(parts[2])
+        tile_y = int(parts[4])
+        
+        # Load and process tile
+        tile_data = load_tile_data(tile_name, bucket_name, dataset_path, pyramid_level)
+        
+        # Calculate accutance for each block in the tile
+        y_block_size = tile_data.shape[0] // n_blocks
+        x_block_size = tile_data.shape[1] // n_blocks
+        
+        for i in range(n_blocks):
+            for j in range(n_blocks):
+                y_start = i * y_block_size
+                y_end = (i + 1) * y_block_size
+                x_start = j * x_block_size
+                x_end = (j + 1) * x_block_size
+                
+                block_data = tile_data[x_start:x_end, y_start:y_end, z_slice]
+                acc = calculate_accutance(block_data, percentile_threshold)
+                
+                # Calculate position in full grid
+                grid_y_pos = tile_y * n_blocks + i
+                grid_x_pos = tile_x * n_blocks + j
+                
+                full_grid[grid_y_pos, grid_x_pos] = acc['mean_accutance']
+    
+    return {
+        'grid_accutance': full_grid,
+        'coverage_map': coverage_map,
+        'dimensions': (grid_x, grid_y),
+        'blocks_per_tile': n_blocks
+    }
+
+def plot_tile_grid_block_accutance(grid_data, z_slice, show_tile_boundaries=True):
+    """
+    Plot the accutance heatmap for all tiles with their block subdivisions.
+    
+    Args:
+        grid_data: Output from calculate_tile_grid_block_accutance
+        z_slice: Z-slice being displayed
+        show_tile_boundaries: Whether to show tile boundaries
+        
+    Returns:
+        fig: Figure object
+        ax: Axes object
+    """
+    grid_accutance = grid_data['grid_accutance']
+    coverage_map = grid_data['coverage_map']
+    grid_x, grid_y = grid_data['dimensions']
+    n_blocks = grid_data['blocks_per_tile']
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(15, 10))
+    
+    # Plot heatmap
+    im = ax.imshow(grid_accutance, cmap='viridis')
+    plt.colorbar(im, ax=ax, label='Mean Accutance')
+    
+    # Add tile boundaries
+    if show_tile_boundaries:
+        for i in range(grid_y):
+            ax.axhline(y=(i+1) * n_blocks - 0.5, color='red', linestyle='-', alpha=0.5)
+        for j in range(grid_x):
+            ax.axvline(x=(j+1) * n_blocks - 0.5, color='red', linestyle='-', alpha=0.5)
+    
+    # Add block grid lines
+    for i in range(grid_accutance.shape[0]):
+        ax.axhline(y=i-0.5, color='white', linestyle='-', alpha=0.1)
+    for j in range(grid_accutance.shape[1]):
+        ax.axvline(x=j-0.5, color='white', linestyle='-', alpha=0.1)
+    
+    # Add labels
+    ax.set_title(f'Tile Grid Block Accutance Map (Z-slice {z_slice})')
+    ax.set_xlabel('X Position (Blocks)')
+    ax.set_ylabel('Y Position (Blocks)')
+    
+    # Add text showing accutance values
+    for i in range(grid_accutance.shape[0]):
+        for j in range(grid_accutance.shape[1]):
+            if not np.isnan(grid_accutance[i, j]):
+                text = f'{grid_accutance[i, j]:.2f}'
+                ax.text(j, i, text, ha='center', va='center', 
+                       color='white', fontsize=8, alpha=0.7)
+    
+    plt.tight_layout()
+    return fig, ax
+
+def plot_tile_grid_block_accutance_with_image(tile_dict, transforms, tile_names, 
+                                             bucket_name, dataset_path, z_slice, 
+                                             n_blocks=3, pyramid_level=0):
+    """
+    Plot both the original stitched image and the accutance heatmap side by side.
+    
+    Args:
+        ... (same as calculate_tile_grid_block_accutance) ...
+        
+    Returns:
+        fig: Figure object
+        axes: List of axes objects [ax_image, ax_heatmap]
+    """
+    # Calculate accutance values
+    grid_data = calculate_tile_grid_block_accutance(
+        tile_dict, transforms, tile_names, bucket_name, dataset_path,
+        z_slice, n_blocks, pyramid_level
+    )
+    
+    # Create figure with two subplots
+    fig, (ax_image, ax_heatmap) = plt.subplots(1, 2, figsize=(20, 8))
+    
+    # Plot stitched image
+    # (You'll need to implement this part based on your stitching functionality)
+    # For now, we'll just show the coverage map
+    ax_image.imshow(grid_data['coverage_map'], cmap='gray')
+    ax_image.set_title(f'Tile Coverage Map\nZ-slice {z_slice}')
+    
+    # Plot heatmap
+    im = ax_heatmap.imshow(grid_data['grid_accutance'], cmap='viridis')
+    plt.colorbar(im, ax=ax_heatmap, label='Mean Accutance')
+    
+    # Add tile boundaries
+    grid_x, grid_y = grid_data['dimensions']
+    n_blocks = grid_data['blocks_per_tile']
+    
+    for i in range(grid_y):
+        ax_heatmap.axhline(y=(i+1) * n_blocks - 0.5, color='red', linestyle='-', alpha=0.5)
+    for j in range(grid_x):
+        ax_heatmap.axvline(x=(j+1) * n_blocks - 0.5, color='red', linestyle='-', alpha=0.5)
+    
+    # Add labels
+    ax_heatmap.set_title('Block Accutance Heatmap')
+    ax_heatmap.set_xlabel('X Position (Blocks)')
+    ax_heatmap.set_ylabel('Y Position (Blocks)')
+    
+    plt.tight_layout()
+    return fig, [ax_image, ax_heatmap]
