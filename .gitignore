@@ -1,3 +1,6 @@
+# add xml_data
+xml_data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

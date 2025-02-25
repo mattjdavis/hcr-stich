@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import dask.array as da
 from pathlib import Path
+import seaborn as sns
 
 def analyze_tile_grid(tile_dict, plot=True):
     """
@@ -776,7 +777,7 @@ def get_transformed_tile_pair(tile1_name, tile2_name, transforms, tile_names,
     return combined, extent, z_slice
 
 def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, bucket_name, dataset_path, 
-                          z_slice=None, pyramid_level=0, save=False, output_dir=None):
+                          slice=None, pyramid_level=0, save=False, output_dir=None):
     """
     Plot a z-slice through two adjacent tiles in their transformed positions.
     Transforms are relative to (0,0) at the center of the nominal grid.
@@ -788,15 +789,69 @@ def plot_adjacent_tile_pair(tile1_name, tile2_name, transforms, tile_names, buck
         tile_names: Dictionary mapping tile IDs to tile names
         bucket_name: S3 bucket name
         dataset_path: Path to dataset in bucket
-        z_slice: Z-slice to display
+        slice: slice in 
         pyramid_level: Pyramid level to load
         save: Whether to save the plot
         output_dir: Directory to save plot if save=True
     """
     # Get the transformed and combined tile data
-    combined, extent, z_slice = get_transformed_tile_pair(
+    combined, extent, slice = get_transformed_tile_pair(
         tile1_name, tile2_name, transforms, tile_names,
-        bucket_name, dataset_path, z_slice, pyramid_level
+        bucket_name, dataset_path, slice, pyramid_level
+    )
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.set_facecolor('black')
+    
+    # Plot combined image
+    ax.imshow(combined, extent=extent)
+    
+    # Add tile information
+    pos1 = parse_tile_name(tile1_name)
+    pos2 = parse_tile_name(tile2_name)
+    ax.set_title(f'Tile Pair Comparison\nRed: {pos1} | Green: {pos2} | Yellow: Overlap\nZ-slice: {z_slice}')
+    
+    # Set axis limits with padding
+    padding = 0.05  # 5% padding
+    x_range = extent[1] - extent[0]
+    y_range = extent[3] - extent[2]
+    ax.set_xlim(extent[0] - x_range * padding, extent[1] + x_range * padding)
+    ax.set_ylim(extent[2] - y_range * padding, extent[3] + y_range * padding)
+    
+    if save and output_dir:
+        output_path = Path(output_dir) / f'tile_pair_{tile1_name}_{tile2_name}_z{z_slice}.png'
+        plt.savefig(output_path)
+        plt.close()
+    else:
+        plt.show()
+        
+    return fig, ax
+
+
+def plot_adjacent_tile_pair_t(tile1_name, tile2_name, 
+                              transforms, tile_names, bucket_name, dataset_path, 
+                          slice=None, pyramid_level=0, save=False, output_dir=None):
+    """
+    Plot a z-slice through two adjacent tiles in their transformed positions.
+    Transforms are relative to (0,0) at the center of the nominal grid.
+    Z-transform is applied before selecting the slice.
+    
+    Args:
+        tile1_name, tile2_name: Names of tiles to compare
+        transforms: Dictionary mapping tile IDs to transformation matrices
+        tile_names: Dictionary mapping tile IDs to tile names
+        bucket_name: S3 bucket name
+        dataset_path: Path to dataset in bucket
+        slice: slice in 
+        pyramid_level: Pyramid level to load
+        save: Whether to save the plot
+        output_dir: Directory to save plot if save=True
+    """
+    # Get the transformed and combined tile data
+    combined, extent, slice = get_transformed_tile_pair(
+        tile1_name, tile2_name, transforms, tile_names,
+        bucket_name, dataset_path, slice, pyramid_level
     )
     
     # Create figure
@@ -1449,24 +1504,27 @@ def plot_block_accutance_profiles(tile_data, tile_name=None, n_blocks=3, axis='z
     
     return fig, ax, profiles
 
-def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_threshold=99):
+def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_threshold=99, 
+                                minmax_lims=(1, 99),
+                               normalize_method: str = None):
     """
     Plot a heatmap of accutance values for each block in an nxn grid at a specific z-slice,
-    alongside the original image slice with grid overlay.
+    alongside the original image slice with grid overlay and detected edges.
     
     Args:
-        tile_data: 3D numpy array (x,y,z)
+        tile_data: 3D numpy array (z,y,x)
         z_slice: Z-slice index to analyze
+        minmax_lims: tuple of (vmin, vmax) to use for image slice
         n_blocks: Number of blocks in each dimension (default 3 for 3x3 grid)
         percentile_threshold: Threshold for edge detection
-        
+        normalize_method: Method to normalize accutance values (default None)
     Returns:
         fig: Figure object
-        axes: List of axes objects [ax_image, ax_heatmap]
+        axes: List of axes objects [ax_image, ax_heatmap, ax_edges]
         accutance_values: 2D array of accutance values
     """
     # Get dimensions
-    x_dim, y_dim, _ = tile_data.shape
+    _, y_dim, x_dim = tile_data.shape
     
     # Calculate block sizes
     y_block_size = y_dim // n_blocks
@@ -1474,6 +1532,10 @@ def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_thre
     
     # Initialize array for accutance values
     accutance_values = np.zeros((n_blocks, n_blocks))
+    
+    # Create an array to store the full edge mask for visualization
+    full_edge_mask = np.zeros((y_dim, x_dim), dtype=bool)
+    full_accutance_map = np.zeros((y_dim, x_dim))
     
     # Calculate accutance for each block
     for i in range(n_blocks):
@@ -1483,16 +1545,29 @@ def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_thre
             x_start = j * x_block_size
             x_end = (j + 1) * x_block_size
             
-            block_data = tile_data[x_start:x_end, y_start:y_end, z_slice]
-            acc = calculate_accutance(block_data, percentile_threshold)
-            accutance_values[i, j] = acc['mean_accutance']
+            block_data = tile_data[z_slice, y_start:y_end, x_start:x_end]
+            
+            acc = calculate_normalized_accutance(block_data, percentile_threshold, normalize_method)
+            if normalize_method:
+                accutance_values[i, j] = acc['normalized_mean_accutance']
+            else:
+                accutance_values[i, j] = acc['raw_mean_accutance']
+            
+            # Store edge mask and accutance map for visualization
+            full_edge_mask[y_start:y_end, x_start:x_end] = acc['edge_mask']
+            full_accutance_map[y_start:y_end, x_start:x_end] = acc['accutance_map']
     
-    # Create figure with two subplots
-    fig, (ax_image, ax_heatmap) = plt.subplots(1, 2, figsize=(16, 7))
+    # Create figure with three subplots
+    sns.set_context('talk')
+    fig, (ax_image, ax_heatmap, ax_edges) = plt.subplots(1, 3, figsize=(24, 7))
     
     # Plot original image
-    image_slice = tile_data[:,:,z_slice]
-    im_image = ax_image.imshow(image_slice, cmap='gray')
+    image_slice = tile_data[z_slice]
+    if minmax_lims is None:
+        im_image = ax_image.imshow(image_slice, cmap='gray')
+    else:
+        vmin, vmax = np.percentile(image_slice, minmax_lims)
+        im_image = ax_image.imshow(image_slice, cmap='gray', vmin=vmin, vmax=vmax)
     ax_image.set_title(f'Original Image\nZ-slice {z_slice}')
     
     # Add grid lines to original image
@@ -1500,7 +1575,7 @@ def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_thre
         ax_image.axhline(y=i * y_block_size, color='r', linestyle='--', alpha=0.5)
         ax_image.axvline(x=i * x_block_size, color='r', linestyle='--', alpha=0.5)
     
-    # Add block numbers to original image
+    # # Add block numbers to original image
     # for i in range(n_blocks):
     #     for j in range(n_blocks):
     #         center_y = (i + 0.5) * y_block_size
@@ -1511,20 +1586,22 @@ def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_thre
     #                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
     
     # Plot heatmap
-    im_heatmap = ax_heatmap.imshow(accutance_values, cmap='viridis')
-    ax_heatmap.set_title('Accutance Heatmap')
+    im_heatmap = ax_heatmap.imshow(accutance_values, cmap='magma')
+    ax_heatmap.set_title(f'Accutance Heatmap\nNormalized: {normalize_method}')
     
     # Add colorbar to heatmap
-    plt.colorbar(im_heatmap, ax=ax_heatmap, label='Mean Accutance')
+    plt.colorbar(im_heatmap, ax=ax_heatmap, label='Accutance')
     
     # Add block labels to heatmap
     for i in range(n_blocks):
         for j in range(n_blocks):
-            text = f'{accutance_values[i, j]:.3f}'
+            text = f'{accutance_values[i, j]:.2f}'
+            # add text with a white background
             ax_heatmap.text(j, i, text, ha='center', va='center', 
-                          color='white', fontweight='bold')
+                          color='black', fontweight='bold', fontsize=18,
+                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
     
-    # Add labels to heatmapS
+    # Add labels to heatmap
     ax_heatmap.set_xticks(range(n_blocks))
     ax_heatmap.set_yticks(range(n_blocks))
     ax_heatmap.set_xlabel('X Block')
@@ -1533,10 +1610,30 @@ def plot_block_accutance_heatmap(tile_data, z_slice, n_blocks=3, percentile_thre
     # Add grid lines to heatmap
     ax_heatmap.grid(True, color='white', linestyle='-', alpha=0.2)
     
+    # Plot edge visualization
+    # Create an overlay with original image and detected edges
+    edge_overlay = np.zeros((y_dim, x_dim, 3))
+    # Add grayscale image to all channels
+    for c in range(3):
+        edge_overlay[:, :, c] = image_slice / np.max(image_slice) if np.max(image_slice) > 0 else 0
+    
+    # Highlight edges in red
+    edge_overlay[full_edge_mask, 0] = 1.0  # Red channel
+    edge_overlay[full_edge_mask, 1] = 0.0  # Green channel
+    edge_overlay[full_edge_mask, 2] = 0.0  # Blue channel
+    
+    ax_edges.imshow(edge_overlay)
+    ax_edges.set_title(f'Detected Edges\nPercentile: {percentile_threshold}')
+    
+    # Add grid lines to edge visualization
+    for i in range(1, n_blocks):
+        ax_edges.axhline(y=i * y_block_size, color='cyan', linestyle='--', alpha=0.5)
+        ax_edges.axvline(x=i * x_block_size, color='cyan', linestyle='--', alpha=0.5)
+    
     # Adjust layout
     plt.tight_layout()
     
-    return fig, [ax_image, ax_heatmap], accutance_values
+    return fig, [ax_image, ax_heatmap, ax_edges], accutance_values
 
 ####
 # All tiles accutance
@@ -1711,3 +1808,120 @@ def plot_tile_grid_block_accutance_with_image(tile_dict, transforms, tile_names,
     
     plt.tight_layout()
     return fig, [ax_image, ax_heatmap]
+
+def calculate_normalized_accutance(image_slice, percentile_threshold=99, normalization_method='edge_density'):
+    """
+    Calculate accutance (edge sharpness) normalized for feature density.
+    
+    Args:
+        image_slice: 2D numpy array containing the image slice
+        percentile_threshold: Percentile threshold for edge detection (default 99)
+        normalization_method: Method for normalization
+            - 'edge_density': Normalize by the percentage of pixels that are edges
+            - 'edge_count': Normalize by the absolute count of edge pixels
+            - 'local_contrast': Use local contrast normalization before edge detection
+            - 'structure_tensor': Use eigenvalues of structure tensor approach
+        
+    Returns:
+        dict containing normalized and raw accutance metrics
+    """
+    from scipy import ndimage
+    
+    # Normalize image to [0,1]
+    img_norm = image_slice.astype(float)
+    if img_norm.max() > 0:
+        img_norm = img_norm / img_norm.max()
+    
+    # Calculate gradients using Sobel operator
+    grad_x = ndimage.sobel(img_norm, axis=1)
+    grad_y = ndimage.sobel(img_norm, axis=0)
+    
+    # Calculate gradient magnitude
+    accutance_map = np.sqrt(grad_x**2 + grad_y**2)
+    
+    # Create edge mask using threshold
+    edge_threshold = np.percentile(accutance_map, percentile_threshold)
+    edge_mask = accutance_map > edge_threshold
+    edge_count = np.sum(edge_mask)
+    total_pixels = edge_mask.size
+    edge_density = edge_count / total_pixels if total_pixels > 0 else 0
+    
+    # Calculate statistics for detected edges
+    edge_values = accutance_map[edge_mask]
+    raw_mean_accutance = edge_values.mean() if edge_values.size > 0 else 0
+    raw_max_accutance = edge_values.max() if edge_values.size > 0 else 0
+    
+    # Normalize based on selected method
+    if normalization_method == 'edge_density':
+        # Normalize by edge density - adjusts for different feature densities
+        # Areas with few edges but sharp will score higher than areas with many edges but blurry
+        norm_factor = max(0.001, edge_density)  # Avoid division by zero
+        normalized_mean = raw_mean_accutance / norm_factor
+        normalized_max = raw_max_accutance / norm_factor
+        
+    elif normalization_method == 'edge_count':
+        # Use logarithmic scaling based on edge count
+        norm_factor = max(1, np.log10(edge_count + 1))
+        normalized_mean = raw_mean_accutance / norm_factor
+        normalized_max = raw_max_accutance / norm_factor
+        
+    elif normalization_method == 'local_contrast':
+        # This method needs to be applied before edge detection
+        # Use local contrast normalization before calculating accutance
+        local_mean = ndimage.uniform_filter(img_norm, size=15)
+        local_std = np.sqrt(ndimage.uniform_filter(img_norm**2, size=15) - local_mean**2)
+        local_std = np.maximum(local_std, 0.0001)  # Avoid division by zero
+        normalized_img = (img_norm - local_mean) / local_std
+        
+        # Recalculate edges on contrast-normalized image
+        norm_grad_x = ndimage.sobel(normalized_img, axis=1)
+        norm_grad_y = ndimage.sobel(normalized_img, axis=0)
+        norm_accutance_map = np.sqrt(norm_grad_x**2 + norm_grad_y**2)
+        
+        # Use same edge threshold approach
+        norm_edge_threshold = np.percentile(norm_accutance_map, percentile_threshold)
+        norm_edge_mask = norm_accutance_map > norm_edge_threshold
+        norm_edge_values = norm_accutance_map[norm_edge_mask]
+        
+        normalized_mean = norm_edge_values.mean() if norm_edge_values.size > 0 else 0
+        normalized_max = norm_edge_values.max() if norm_edge_values.size > 0 else 0
+        
+    elif normalization_method == 'structure_tensor':
+        # Structure tensor approach (based on Harris corner detector)
+        # This weights edge strength by local structure importance
+        gaussian_filter = lambda x, sigma: ndimage.gaussian_filter(x, sigma)
+        gx2 = gaussian_filter(grad_x * grad_x, 1.5)
+        gy2 = gaussian_filter(grad_y * grad_y, 1.5)
+        gxy = gaussian_filter(grad_x * grad_y, 1.5)
+        
+        # Eigenvalues represent strength of edge/corner response
+        # For each pixel, calculate the trace and determinant
+        trace = gx2 + gy2
+        det = gx2 * gy2 - gxy * gxy
+        
+        # Calculate eigenvalues (λ1 ≥ λ2)
+        # Using: λ1,λ2 = (trace/2) ± sqrt((trace/2)^2 - det)
+        trace_half = trace / 2
+        discriminant = np.sqrt(np.maximum(0, trace_half**2 - det))
+        lambda1 = trace_half + discriminant  # Larger eigenvalue
+        
+        # Use largest eigenvalue as corner/edge strength measure
+        structure_strength = lambda1
+        normalized_mean = np.mean(structure_strength)
+        normalized_max = np.max(structure_strength)
+    
+    else:
+        normalized_mean = raw_mean_accutance
+        normalized_max = raw_max_accutance
+    
+    return {
+        'raw_mean_accutance': raw_mean_accutance,
+        'raw_max_accutance': raw_max_accutance,
+        'normalized_mean_accutance': normalized_mean,
+        'normalized_max_accutance': normalized_max,
+        'edge_density': edge_density,
+        'edge_count': edge_count,
+        'accutance_map': accutance_map,
+        'edge_mask': edge_mask,
+        'normalization_method': normalization_method
+    }
