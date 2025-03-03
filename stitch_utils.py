@@ -4,6 +4,9 @@ import dask.array as da
 from pathlib import Path
 import seaborn as sns
 
+from io_utils import TileData
+
+
 import pathlib
 import boto3
 
@@ -211,8 +214,6 @@ def plot_transform_heatmaps(tile_dict,
     y_scale_index = np.arange(y_dim) - (y_dim - 1) / 2
     x_scale_index = x_scale_index * tile_dims[0] * (1 - overlap)
     y_scale_index = y_scale_index * tile_dims[1] * (1 - overlap)
-    print(x_scale_index)
-    print(y_scale_index)
     
     # Fill in the transform values
     for tile_id, tile_name in tile_dict.items():
@@ -270,73 +271,6 @@ def plot_transform_heatmaps(tile_dict,
     plt.show()
     
     return x_transforms, y_transforms, z_transforms
-
-
-from collections import defaultdict
-import numpy as np
-
-def calculate_net_transforms(
-    view_transforms: dict[int, list[dict]]
-) -> dict[int, np.ndarray]:
-    """
-    Accumulate net transform and net translation for each matrix stack.
-    Net translation =
-        Sum of translation vectors converted into original nominal basis
-    Net transform =
-        Product of 3x3 matrices
-    NOTE: Translational component (last column) is defined
-          wrt to the DOMAIN, not codomain.
-          Implementation is informed by this given.
-
-    NOTE: Carsons version 2/21
-    Parameters
-    ------------------------
-    view_transforms: dict[int, list[dict]]
-        Dictionary of tile ids to transforms associated with each tile.
-
-    Returns
-    ------------------------
-    dict[int, np.ndarray]:
-        Dictionary of tile ids to net transform.
-
-    """
-
-    identity_transform = np.array(
-        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
-    )
-    net_transforms: dict[int, np.ndarray] = defaultdict(
-        lambda: np.copy(identity_transform)
-    )
-
-    for view, tfs in view_transforms.items():
-        net_translation = np.zeros(3)
-        net_matrix_3x3 = np.eye(3)
-        curr_inverse = np.eye(3)
-
-        for (tf) in (tfs):  # Tfs is a list of dicts containing transform under 'affine' key
-            nums = [float(val) for val in tf["affine"].split(" ")]
-            matrix_3x3 = np.array([nums[0::4], nums[1::4], nums[2::4]])
-            translation = np.array(nums[3::4])
-            
-            # print(translation)
-            nums = np.array(nums).reshape(3,4)
-            matrix_3x3 = np.array([nums[:,0], nums[:,1], nums[:,2]]).T
-            translation = np.array(nums[:,3])
-            
-            #old way
-            net_translation = net_translation + (curr_inverse @ translation)
-            net_matrix_3x3 = matrix_3x3 @ net_matrix_3x3  
-            curr_inverse = np.linalg.inv(net_matrix_3x3)  # Update curr_inverse
-
-            #new way
-            #net_translation = net_translation + (translation)
-            #net_matrix_3x3 = net_matrix_3x3 @ matrix_3x3 
-
-        net_transforms[view] = np.hstack(
-            (net_matrix_3x3, net_translation.reshape(3, 1))
-        )
-
-    return net_transforms
 
 
 def get_tile_grid_dimensions(tile_names):
@@ -654,7 +588,8 @@ def plot_transform_differences_histogram(stats, bins=50):
     plt.show()
 
 
-def get_transformed_tile_pair(tile1_name, tile2_name, transforms, tile_names, 
+def get_transformed_tile_pair(tile1_name, tile2_name, 
+                              transforms, tile_names, 
                               bucket_name, dataset_path, 
                              z_slice=None, pyramid_level=0):
     """
@@ -2495,3 +2430,396 @@ def calculate_normalized_accutance(image_slice, percentile_threshold=99, normali
         'edge_mask': edge_mask,
         'normalization_method': normalization_method
     }
+
+def analyze_tile_overlap(tile1: TileData, tile2: TileData, 
+                        transform1: np.ndarray, transform2: np.ndarray,
+                        padding: int = 50):
+    """
+    Analyze the overlap between two tiles and return sliced data from overlapping regions.
+    Automatically scales transformations based on pyramid level.
+    """
+    # Get tile dimensions
+    tile1.connect()
+    tile2.connect()
+    
+    # Scale transformations based on pyramid level
+    def scale_transform(transform, pyramid_level):
+        # Create scaled transform
+        scale_factor = 2**pyramid_level
+        scaled = transform.copy()
+        # Scale translation components (last column)
+        scaled[:2, 3] = scaled[:2, 3] / scale_factor
+        return scaled
+    
+    # Scale transforms for current pyramid levels
+    transform1_scaled = scale_transform(transform1, tile1.pyramid_level)
+    transform2_scaled = scale_transform(transform2, tile2.pyramid_level)
+    
+    # Rest of the function remains the same but uses scaled transforms
+    def get_tile_corners(shape, transform):
+        y_dim, x_dim = shape[1:3]
+        corners = np.array([
+            [0, 0, 1],
+            [x_dim, 0, 1],
+            [x_dim, y_dim, 1],
+            [0, y_dim, 1]
+        ])
+        
+        global_corners = np.zeros((4, 2))
+        for i, corner in enumerate(corners):
+            transformed = transform[:2, :3] @ corner[:, np.newaxis]
+            global_corners[i] = transformed.flatten() + transform[:2, 3]
+            
+        return global_corners
+    
+    corners1 = get_tile_corners(tile1.shape, transform1_scaled)
+    corners2 = get_tile_corners(tile2.shape, transform2_scaled)
+    
+    # Calculate bounding boxes
+    def get_bbox(corners):
+        min_x = np.min(corners[:, 0])
+        max_x = np.max(corners[:, 0])
+        min_y = np.min(corners[:, 1])
+        max_y = np.max(corners[:, 1])
+        return np.array([[min_x, min_y], [max_x, max_y]])
+    
+    bbox1 = get_bbox(corners1)
+    bbox2 = get_bbox(corners2)
+    
+    # Calculate overlap
+    overlap_bbox = np.array([
+        [max(bbox1[0, 0], bbox2[0, 0]), max(bbox1[0, 1], bbox2[0, 1])],
+        [min(bbox1[1, 0], bbox2[1, 0]), min(bbox1[1, 1], bbox2[1, 1])]
+    ])
+    
+    # Check if there is actually an overlap
+    if (overlap_bbox[1] <= overlap_bbox[0]).any():
+        print("No overlap between tiles")
+        return None
+    
+    # For each tile, extend the overlap region inward by padding amount
+    # If tile1 is on the left, extend right. If on right, extend left
+    if bbox1[0, 0] < bbox2[0, 0]:  # tile1 is on the left
+        overlap_bbox[1, 0] += padding  # extend right for tile1
+        overlap_bbox[0, 0] -= padding  # extend left for tile2
+    else:  # tile1 is on the right
+        overlap_bbox[0, 0] -= padding  # extend left for tile1
+        overlap_bbox[1, 0] += padding  # extend right for tile2
+        
+    # If tile1 is above, extend down. If below, extend up
+    if bbox1[0, 1] < bbox2[0, 1]:  # tile1 is above
+        overlap_bbox[1, 1] += padding  # extend down for tile1
+        overlap_bbox[0, 1] -= padding  # extend up for tile2
+    else:  # tile1 is below
+        overlap_bbox[0, 1] -= padding  # extend up for tile1
+        overlap_bbox[1, 1] += padding  # extend down for tile2
+    
+    # Convert global coordinates back to tile coordinates
+    def global_to_tile_coords(points, transform):
+        # Create full inverse transform (3x4 -> 3x3)
+        full_transform = np.eye(3)
+        full_transform[:2, :2] = transform[:2, :2]  # Copy rotation/scale part
+        full_transform[:2, 2] = transform[:2, 3]    # Copy translation part
+        inv_transform = np.linalg.inv(full_transform)
+        
+        # Convert points to homogeneous coordinates
+        points_h = np.hstack([points, np.ones((points.shape[0], 1))])
+        
+        # Apply inverse transform
+        tile_coords = points_h @ inv_transform.T
+        return tile_coords[:, :2].T
+    
+    # Get slice bounds for each tile
+    overlap_corners = np.array([
+        [overlap_bbox[0, 0], overlap_bbox[0, 1]],  # Top-left
+        [overlap_bbox[1, 0], overlap_bbox[0, 1]],  # Top-right
+        [overlap_bbox[1, 0], overlap_bbox[1, 1]],  # Bottom-right
+        [overlap_bbox[0, 0], overlap_bbox[1, 1]]   # Bottom-left
+    ])
+    
+    tile1_coords = global_to_tile_coords(overlap_corners, transform1_scaled)
+    tile2_coords = global_to_tile_coords(overlap_corners, transform2_scaled)
+    
+    # Get integer slice bounds
+    def get_slice_bounds(coords, shape):
+        min_x = max(0, int(np.floor(np.min(coords[0]))))
+        max_x = min(int(np.ceil(np.max(coords[0]))), shape[2])
+        min_y = max(0, int(np.floor(np.min(coords[1]))))
+        max_y = min(int(np.ceil(np.max(coords[1]))), shape[1])
+        return (min_y, max_y, min_x, max_x)
+    
+    tile1_bounds = get_slice_bounds(tile1_coords, tile1.shape)
+    tile2_bounds = get_slice_bounds(tile2_coords, tile2.shape)
+    
+    # # Print debug info
+    # print(f"Tile 1 global bbox: {bbox1}")
+    # print(f"Tile 2 global bbox: {bbox2}")
+    # print(f"Overlap bbox: {overlap_bbox}")
+    # print(f"Tile 1 local coords:\n{tile1_coords.T}")
+    # print(f"Tile 2 local coords:\n{tile2_coords.T}")
+    
+    return {
+        'overlap_bbox': overlap_bbox,
+        'tile1_bounds': tile1_bounds,
+        'tile2_bounds': tile2_bounds,
+        'global_bbox1': bbox1,
+        'global_bbox2': bbox2,
+        'tile1_coords': tile1_coords,
+        'tile2_coords': tile2_coords
+    }
+
+def visualize_tile_overlap(tile1: TileData, tile2: TileData,
+                          transform1: np.ndarray, transform2: np.ndarray,
+                          z_slice: int, padding: int = 50):
+    """
+    Create an RGB visualization of overlapping regions between two tiles.
+    Creates a composite image of just the overlap region plus padding.
+    """
+    # Get overlap information
+    overlap_info = analyze_tile_overlap(tile1, tile2, transform1, transform2, padding)
+    
+    # Extract slices from each tile
+    t1_y1, t1_y2, t1_x1, t1_x2 = overlap_info['tile1_bounds']
+    t2_y1, t2_y2, t2_x1, t2_x2 = overlap_info['tile2_bounds']
+    
+    # Get data slices
+    tile1_data = tile1.get_slice(z_slice, 'xy')[t1_y1:t1_y2, t1_x1:t1_x2]
+    tile2_data = tile2.get_slice(z_slice, 'xy')[t2_y1:t2_y2, t2_x1:t2_x2]
+    
+    # Normalize data to [0,1]
+    def normalize(data):
+        if data.max() > data.min():
+            return (data - data.min()) / (data.max() - data.min())
+        return data - data.min()
+    
+    tile1_norm = normalize(tile1_data)
+    tile2_norm = normalize(tile2_data)
+    
+    # Get bounding boxes
+    bbox1 = overlap_info['global_bbox1']
+    bbox2 = overlap_info['global_bbox2']
+    overlap_bbox = overlap_info['overlap_bbox']
+    
+    # Print debug info for bounding boxes
+    # print("Global bounding boxes:")
+    # print(f"Tile 1: {bbox1}")
+    # print(f"Tile 2: {bbox2}")
+    # print(f"Overlap: {overlap_bbox}")
+    
+    # Calculate composite image dimensions
+    height = int(np.ceil(overlap_bbox[1, 1] - overlap_bbox[0, 1]))
+    width = int(np.ceil(overlap_bbox[1, 0] - overlap_bbox[0, 0]))
+    print(f"Composite dimensions: {width}x{height}")
+    
+    # Create empty RGB image
+    composite = np.zeros((height, width, 3))
+    
+    # Calculate relative positions in the overlap region
+    def get_relative_coords(data_bbox):
+        # Ensure coordinates are non-negative
+        x = max(0, int(data_bbox[0, 0] - overlap_bbox[0, 0]))
+        y = max(0, int(data_bbox[0, 1] - overlap_bbox[0, 1]))
+        return y, x
+    
+    # Get positions and print debug info
+    t1_y, t1_x = get_relative_coords(bbox1)
+    t2_y, t2_x = get_relative_coords(bbox2)
+    
+    print("\nPlacement coordinates:")
+    print(f"Tile 1: y={t1_y}, x={t1_x}, shape={tile1_norm.shape}")
+    print(f"Tile 2: y={t2_y}, x={t2_x}, shape={tile2_norm.shape}")
+    
+    # Ensure we're not trying to place data outside the composite image
+    def safe_place_data(data, y_start, x_start, channel):
+        y_end = min(y_start + data.shape[0], composite.shape[0])
+        x_end = min(x_start + data.shape[1], composite.shape[1])
+        y_start = max(0, y_start)
+        x_start = max(0, x_start)
+        
+        if y_end > y_start and x_end > x_start:
+            y_data = min(data.shape[0], y_end - y_start)
+            x_data = min(data.shape[1], x_end - x_start)
+            composite[y_start:y_end, x_start:x_end, channel] = data[:y_data, :x_data]
+    
+    # Place the data safely
+    safe_place_data(tile1_norm, t1_y, t1_x, 0)
+    safe_place_data(tile2_norm, t2_y, t2_x, 1)
+    
+    return {
+        'composite': composite,
+        'overlap_info': overlap_info,
+        'tile1_data': tile1_data,
+        'tile2_data': tile2_data,
+        'image_coords': {
+            'tile1': (t1_y, t1_x),
+            'tile2': (t2_y, t2_x)
+        }
+    }
+
+def plot_transformed_tiles(tile1: TileData, tile2: TileData, 
+                         transform1: np.ndarray, transform2: np.ndarray,
+                         padding: int = 50):
+    """
+    Create a visualization of the transformed tile boundaries and their overlap.
+    Automatically scales transformations based on pyramid level.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+    
+    # Scale transformations based on pyramid level
+    def scale_transform(transform, pyramid_level):
+        scale_factor = 2**pyramid_level
+        scaled = transform.copy()
+        scaled[:2, 3] = scaled[:2, 3] / scale_factor
+        return scaled
+    
+    # Scale transforms for current pyramid levels
+    transform1_scaled = scale_transform(transform1, tile1.pyramid_level)
+    transform2_scaled = scale_transform(transform2, tile2.pyramid_level)
+    
+    # Get tile corners and bounding boxes
+    def get_tile_corners(shape, transform):
+        y_dim, x_dim = shape[1:3]
+        corners = np.array([
+            [0, 0, 1],
+            [x_dim, 0, 1],
+            [x_dim, y_dim, 1],
+            [0, y_dim, 1]
+        ])
+        
+        global_corners = np.zeros((4, 2))
+        for i, corner in enumerate(corners):
+            transformed = transform[:2, :3] @ corner[:, np.newaxis]
+            global_corners[i] = transformed.flatten() + transform[:2, 3]
+            
+        return global_corners
+    
+    corners1 = get_tile_corners(tile1.shape, transform1_scaled)
+    corners2 = get_tile_corners(tile2.shape, transform2_scaled)
+    
+    # Add pyramid level info to title
+    title = f"Transformed Tile Boundaries\n"
+    title += f"Tile 1 shape: {tile1.shape} (level {tile1.pyramid_level})\n"
+    title += f"Tile 2 shape: {tile2.shape} (level {tile2.pyramid_level})"
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Plot tile boundaries
+    poly1 = Polygon(corners1, alpha=0.3, color='red', label='Tile 1')
+    poly2 = Polygon(corners2, alpha=0.3, color='green', label='Tile 2')
+    ax.add_patch(poly1)
+    ax.add_patch(poly2)
+    
+    # Plot corner points
+    ax.scatter(corners1[:, 0], corners1[:, 1], color='red', marker='o')
+    ax.scatter(corners2[:, 0], corners2[:, 1], color='green', marker='o')
+    
+    # Add corner labels
+    for i, (x, y) in enumerate(corners1):
+        ax.annotate(f'T1-{i}', (x, y), xytext=(5, 5), textcoords='offset points')
+    for i, (x, y) in enumerate(corners2):
+        ax.annotate(f'T2-{i}', (x, y), xytext=(5, 5), textcoords='offset points')
+    
+    # Plot centers and translations
+    center1 = np.mean(corners1, axis=0)
+    center2 = np.mean(corners2, axis=0)
+    ax.scatter([center1[0]], [center1[1]], color='red', marker='x', s=100, label='Tile 1 Center')
+    ax.scatter([center2[0]], [center2[1]], color='green', marker='x', s=100, label='Tile 2 Center')
+    
+    # Plot translation vectors
+    ax.arrow(center1[0], center1[1], 
+            transform1_scaled[0, 3], transform1_scaled[1, 3],
+            head_width=20, head_length=20, fc='red', ec='red', alpha=0.5)
+    ax.arrow(center2[0], center2[1],
+            transform2_scaled[0, 3], transform2_scaled[1, 3],
+            head_width=20, head_length=20, fc='green', ec='green', alpha=0.5)
+    
+    # Calculate and plot overlap region if it exists
+    bbox1 = np.array([[np.min(corners1[:, 0]), np.min(corners1[:, 1])],
+                     [np.max(corners1[:, 0]), np.max(corners1[:, 1])]])
+    bbox2 = np.array([[np.min(corners2[:, 0]), np.min(corners2[:, 1])],
+                     [np.max(corners2[:, 0]), np.max(corners2[:, 1])]])
+    
+    overlap_bbox = np.array([
+        [max(bbox1[0, 0], bbox2[0, 0]), max(bbox1[0, 1], bbox2[0, 1])],
+        [min(bbox1[1, 0], bbox2[1, 0]), min(bbox1[1, 1], bbox2[1, 1])]
+    ])
+    
+    if (overlap_bbox[1] > overlap_bbox[0]).all():
+        overlap_corners = np.array([
+            [overlap_bbox[0, 0], overlap_bbox[0, 1]],
+            [overlap_bbox[1, 0], overlap_bbox[0, 1]],
+            [overlap_bbox[1, 0], overlap_bbox[1, 1]],
+            [overlap_bbox[0, 0], overlap_bbox[1, 1]]
+        ])
+        poly_overlap = Polygon(overlap_corners, alpha=0.3, color='yellow', label='Overlap')
+        ax.add_patch(poly_overlap)
+    
+    # Set plot limits and labels
+    ax.set_xlim(min(corners1[:, 0].min(), corners2[:, 0].min()) - padding, 
+                max(corners1[:, 0].max(), corners2[:, 0].max()) + padding)
+    ax.set_ylim(min(corners1[:, 1].min(), corners2[:, 1].min()) - padding, 
+                max(corners1[:, 1].max(), corners2[:, 1].max()) + padding)
+    ax.set_aspect('equal')
+    ax.grid(True)
+    ax.legend()
+    
+    # Add title with shape information
+    ax.set_title(title)
+    
+    return fig, ax
+
+def visualize_orthogonal_views(self, z_slice=None, y_slice=None, x_slice=None, overlap_only=False):
+    """
+    Visualize orthogonal views of the paired tiles.
+    Data is in (X,Y,Z) order.
+    """
+    # Use middle slices by default
+    if x_slice is None:
+        x_slice = self.composite_shape[0] // 2  # X is first dimension
+    if y_slice is None:
+        y_slice = self.composite_shape[1] // 2  # Y is middle dimension
+    if z_slice is None:
+        z_slice = self.composite_shape[2] // 2  # Z is last dimension
+    
+    # Create figure with three subplots
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # XY slice (fix Z)
+    xy_slice = self.composite[:, :, z_slice]  # Get XY plane at Z
+    axes[0].imshow(xy_slice)
+    axes[0].set_title(f"XY slice at Z={z_slice}")
+    axes[0].set_xlabel('Y')
+    axes[0].set_ylabel('X')
+    
+    # XZ slice (fix Y)
+    xz_slice = self.composite[:, y_slice, :]  # Get XZ plane at Y
+    axes[1].imshow(xz_slice)
+    axes[1].set_title(f"XZ slice at Y={y_slice}")
+    axes[1].set_xlabel('Z')
+    axes[1].set_ylabel('X')
+    
+    # YZ slice (fix X)
+    yz_slice = self.composite[x_slice, :, :]  # Get YZ plane at X
+    axes[2].imshow(yz_slice)
+    axes[2].set_title(f"YZ slice at X={x_slice}")
+    axes[2].set_xlabel('Z')
+    axes[2].set_ylabel('Y')
+    
+    # Add legend
+    legend_elements = [
+        Line2D([0], [0], color='r', lw=4, label=f'Tile 1 ({self.name1})'),
+        Line2D([0], [0], color='g', lw=4, label=f'Tile 2 ({self.name2})'),
+        Line2D([0], [0], color='y', lw=4, label='Overlap')
+    ]
+    for ax in axes:
+        ax.legend(handles=legend_elements, loc='upper right')
+    
+    # Add overall title
+    plt.suptitle(f"Orthogonal Views of Paired Tiles\n({self.name1}) (red) and ({self.name2}) (green)", fontsize=12)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85)
+    
+    return fig, axes

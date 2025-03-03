@@ -3,9 +3,10 @@ import zarr
 import dask.array as da
 import boto3
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 from ng_link import parsers
-
+from collections import defaultdict
 
 
 def load_tile_data(tile_name: str, 
@@ -166,8 +167,6 @@ def channel_data_from_parsed_xml(data, channel):
     594: 68
     405: 6
 
-
-
     """
 
     channel_keys = data["channel_keys_map"]
@@ -203,3 +202,746 @@ def load_tile_data(tile_name: str,
     zarr_path = f"s3://{bucket_name}/{tile_array_loc}"
     tile_data = da.from_zarr(url=zarr_path, storage_options={'anon': False}).squeeze()
     return tile_data.compute().transpose(dims_order)
+
+
+# def load_slice_data(tile_name: str, 
+#                   bucket_name: str, 
+#                   dataset_path: str, 
+#                   slice_r
+#                   pyramid_level:int = 0,
+#                   dims_order:tuple = (1,2,0)) -> np.ndarray:
+#     """
+#     Load tile data from zarr
+#     Zarrs are stored in (z,y,x) order
+#     (1,2,0) is the order of the dimensions in the zarr file
+#     """
+#     tile_array_loc = f"{dataset_path}{tile_name}/{pyramid_level}"
+#     zarr_path = f"s3://{bucket_name}/{tile_array_loc}"
+#     tile_data = da.from_zarr(url=zarr_path, storage_options={'anon': False}).squeeze()
+#     # get the slice at z_slice
+#     slice_data = tile_data[z_slice, :, :]
+#     return slice_data.compute().transpose(dims_order)
+
+
+def calculate_net_transforms(
+    view_transforms: dict[int, list[dict]]
+) -> dict[int, np.ndarray]:
+    """
+    Accumulate net transform and net translation for each matrix stack.
+    Net translation =
+        Sum of translation vectors converted into original nominal basis
+    Net transform =
+        Product of 3x3 matrices
+    NOTE: Translational component (last column) is defined
+          wrt to the DOMAIN, not codomain.
+          Implementation is informed by this given.
+
+    NOTE: Carsons version 2/21
+    Parameters
+    ------------------------
+    view_transforms: dict[int, list[dict]]
+        Dictionary of tile ids to transforms associated with each tile.
+
+    Returns
+    ------------------------
+    dict[int, np.ndarray]:
+        Dictionary of tile ids to net transform.
+
+    """
+
+    identity_transform = np.array(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+    )
+    net_transforms: dict[int, np.ndarray] = defaultdict(
+        lambda: np.copy(identity_transform)
+    )
+
+    for view, tfs in view_transforms.items():
+        net_translation = np.zeros(3)
+        net_matrix_3x3 = np.eye(3)
+        curr_inverse = np.eye(3)
+
+        for (tf) in (tfs):  # Tfs is a list of dicts containing transform under 'affine' key
+            nums = [float(val) for val in tf["affine"].split(" ")]
+            matrix_3x3 = np.array([nums[0::4], nums[1::4], nums[2::4]])
+            translation = np.array(nums[3::4])
+            
+            # print(translation)
+            nums = np.array(nums).reshape(3,4)
+            matrix_3x3 = np.array([nums[:,0], nums[:,1], nums[:,2]]).T
+            translation = np.array(nums[:,3])
+            
+            #old way
+            net_translation = net_translation + (curr_inverse @ translation)
+            net_matrix_3x3 = matrix_3x3 @ net_matrix_3x3  
+            curr_inverse = np.linalg.inv(net_matrix_3x3)  # Update curr_inverse
+
+            #new way
+            #net_translation = net_translation + (translation)
+            #net_matrix_3x3 = net_matrix_3x3 @ matrix_3x3 
+
+        net_transforms[view] = np.hstack(
+            (net_matrix_3x3, net_translation.reshape(3, 1))
+        )
+
+    return net_transforms
+
+class TileData:
+    """
+    A class for lazily loading and manipulating tile data with flexible slicing and projection options.
+    
+    This class maintains the original dask array for memory efficiency and only computes data when needed.
+    It provides methods to access data in different orientations (XY, ZY, ZX) and to perform projections.
+    """
+    
+    def __init__(self, tile_name, bucket_name, dataset_path, pyramid_level=0):
+        """
+        Initialize the TileData object.
+        
+        Args:
+            tile_name: Name of the tile
+            bucket_name: S3 bucket name
+            dataset_path: Path to dataset in bucket
+            pyramid_level: Pyramid level to load (default 0)
+        """
+        self.tile_name = tile_name
+        self.bucket_name = bucket_name
+        self.dataset_path = dataset_path
+        self.pyramid_level = pyramid_level
+        self._data = None
+        self._loaded = False
+        
+    def _load_lazy(self):
+        """Lazily load the data as a dask array without computing"""
+        if not self._loaded:
+            tile_array_loc = f"{self.dataset_path}{self.tile_name}/{self.pyramid_level}"
+            zarr_path = f"s3://{self.bucket_name}/{tile_array_loc}"
+            self._data = da.from_zarr(url=zarr_path, storage_options={'anon': False}).squeeze()
+            self._loaded = True
+            
+            # Store shape information
+            self.shape = self._data.shape
+            # Assuming zarr is stored in (z,y,x) order
+            self.z_dim, self.y_dim, self.x_dim = self.shape
+    
+    @property
+    def data(self):
+        """Get the full computed data in (x,y,z) order"""
+        self._load_lazy()
+        return self._data.compute().transpose(2,1,0)
+    
+    @property
+    def data_raw(self):
+        """Get the full computed data in original (z,y,x) order"""
+        self._load_lazy()
+        return self._data.compute()
+    
+    @property
+    def dask_array(self):
+        """Get the underlying dask array without computing"""
+        self._load_lazy()
+        return self._data
+
+    def connect(self):
+        """Establish connection to the data source without computing"""
+        self._load_lazy()
+        return self
+    
+    def get_slice(self, index, orientation='xy', compute=True):
+        """
+        Get a 2D slice through the data in the specified orientation.
+        
+        Args:
+            index: Index of the slice
+            orientation: One of 'xy', 'zy', 'zx' (default 'xy')
+            compute: Whether to compute the dask array (default True)
+            
+        Returns:
+            2D numpy array or dask array
+        """
+        self._load_lazy()
+        
+        if orientation == 'xy':
+            # XY slice at specific Z
+            if index >= self.z_dim:
+                raise IndexError(f"Z index {index} out of bounds (max {self.z_dim-1})")
+            slice_data = self._data[index, :, :]
+        elif orientation == 'zy':
+            # ZY slice at specific X
+            if index >= self.x_dim:
+                raise IndexError(f"X index {index} out of bounds (max {self.x_dim-1})")
+            slice_data = self._data[:, :, index]
+        elif orientation == 'zx':
+            # ZX slice at specific Y
+            if index >= self.y_dim:
+                raise IndexError(f"Y index {index} out of bounds (max {self.y_dim-1})")
+            slice_data = self._data[:, index, :]
+        else:
+            raise ValueError(f"Unknown orientation: {orientation}. Use 'xy', 'zy', or 'zx'")
+        
+        if compute:
+            return slice_data.compute()
+        return slice_data
+    
+    def get_slice_range(self, start, end, axis='z', compute=True):
+        """
+        Get a range of slices along the specified axis.
+        
+        Args:
+            start: Start index (inclusive)
+            end: End index (exclusive)
+            axis: One of 'z', 'y', 'x' (default 'z')
+            compute: Whether to compute the dask array (default True)
+            
+        Returns:
+            3D numpy array or dask array
+        """
+        self._load_lazy()
+        
+        if axis == 'z':
+            if end > self.z_dim:
+                raise IndexError(f"Z end index {end} out of bounds (max {self.z_dim})")
+            slice_data = self._data[start:end, :, :]
+        elif axis == 'y':
+            if end > self.y_dim:
+                raise IndexError(f"Y end index {end} out of bounds (max {self.y_dim})")
+            slice_data = self._data[:, start:end, :]
+        elif axis == 'x':
+            if end > self.x_dim:
+                raise IndexError(f"X end index {end} out of bounds (max {self.x_dim})")
+            slice_data = self._data[:, :, start:end]
+        else:
+            raise ValueError(f"Unknown axis: {axis}. Use 'z', 'y', or 'x'")
+        
+        if compute:
+            return slice_data.compute()
+        return slice_data
+    
+    def project(self, axis='z', method='max', start=None, end=None, compute=True):
+        """
+        Project data along the specified axis using the specified method.
+        
+        Args:
+            axis: One of 'z', 'y', 'x' (default 'z')
+            method: One of 'max', 'mean', 'min', 'sum' (default 'max')
+            start: Start index for projection range (default None = 0)
+            end: End index for projection range (default None = full dimension)
+            compute: Whether to compute the dask array (default True)
+            
+        Returns:
+            2D numpy array or dask array
+        """
+        self._load_lazy()
+        
+        # Set default range
+        if start is None:
+            start = 0
+        if end is None:
+            if axis == 'z':
+                end = self.z_dim
+            elif axis == 'y':
+                end = self.y_dim
+            else:
+                end = self.x_dim
+        
+        # Get the slice range
+        range_data = self.get_slice_range(start, end, axis, compute=False)
+        
+        # Apply projection method
+        if method == 'max':
+            if axis == 'z':
+                result = range_data.max(axis=0)
+            elif axis == 'y':
+                result = range_data.max(axis=1)
+            else:  # axis == 'x'
+                result = range_data.max(axis=2)
+        elif method == 'mean':
+            if axis == 'z':
+                result = range_data.mean(axis=0)
+            elif axis == 'y':
+                result = range_data.mean(axis=1)
+            else:  # axis == 'x'
+                result = range_data.mean(axis=2)
+        elif method == 'min':
+            if axis == 'z':
+                result = range_data.min(axis=0)
+            elif axis == 'y':
+                result = range_data.min(axis=1)
+            else:  # axis == 'x'
+                result = range_data.min(axis=2)
+        elif method == 'sum':
+            if axis == 'z':
+                result = range_data.sum(axis=0)
+            elif axis == 'y':
+                result = range_data.sum(axis=1)
+            else:  # axis == 'x'
+                result = range_data.sum(axis=2)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'max', 'mean', 'min', or 'sum'")
+        
+        if compute:
+            return result.compute()
+        return result
+    
+    def get_orthogonal_views(self, z_index=None, y_index=None, x_index=None, compute=True):
+        """
+        Get orthogonal views (XY, ZY, ZX) at the specified indices.
+        
+        Args:
+            z_index: Z index for XY view (default None = middle slice)
+            y_index: Y index for ZX view (default None = middle slice)
+            x_index: X index for ZY view (default None = middle slice)
+            compute: Whether to compute the dask arrays (default True)
+            
+        Returns:
+            dict with keys 'xy', 'zy', 'zx' containing the respective views
+        """
+        self._load_lazy()
+        
+        # Use middle slices by default
+        if z_index is None:
+            z_index = self.z_dim // 2
+        if y_index is None:
+            y_index = self.y_dim // 2
+        if x_index is None:
+            x_index = self.x_dim // 2
+        
+        # Get the three orthogonal views
+        xy_view = self.get_slice(z_index, 'xy', compute)
+        zy_view = self.get_slice(x_index, 'zy', compute)
+        zx_view = self.get_slice(y_index, 'zx', compute)
+        
+        return {
+            'xy': xy_view,
+            'zy': zy_view,
+            'zx': zx_view
+        }
+
+    def set_pyramid_level(self, level: int):
+        """
+        Set the pyramid level and clear any loaded data.
+        
+        Args:
+            level: New pyramid level to use
+            
+        Returns:
+            self (for method chaining)
+        """
+        if level != self.pyramid_level:
+            self.pyramid_level = level
+            # Clear loaded data so it will be reloaded at new pyramid level
+            self._data = None
+            self._loaded = False
+        return self
+
+
+    def calculate_max_slice(self, level_to_use=2):
+        """
+
+        Use pyramidal level 3 and calulate the mean of the slices in all 3 dimensions,
+        report back using the index for all pyramid levels.
+
+        scale = int(2**pyramid_level)
+
+        Help to get estimates of where lots of signal is in the tile.
+
+        """
+        level_to_use = level_to_use
+        self.set_pyramid_level(level_to_use)
+
+        # first load the data
+        data = self.data
+
+        max_slices = {}
+        # find index of max slice in z
+        max_slice_z = data.mean(axis=0)
+        max_slice_z_index = np.unravel_index(max_slice_z.argmax(), max_slice_z.shape)
+        max_slice_y = data.mean(axis=1)
+        max_slice_y_index = np.unravel_index(max_slice_y.argmax(), max_slice_y.shape)
+        max_slice_x = data.mean(axis=2)
+        max_slice_x_index = np.unravel_index(max_slice_x.argmax(), max_slice_x.shape)
+
+        pyramid_levels = [0,1,2,3]
+
+        max_slices[level_to_use] = {
+            "z": int(max_slice_z_index[0]),
+            "y": int(max_slice_y_index[0]),
+            "x": int(max_slice_x_index[0])
+        }
+
+        # remove level_to_use from pyramid_levels
+        pyramid_levels.remove(level_to_use)
+
+        for level in pyramid_levels:
+            if level_to_use >= level:
+                scale_factor = 2**(level_to_use - level)
+            else:
+                print(f"level_to_use: {level_to_use}, level: {level}")
+                scale_factor = 1/(2**(level - level_to_use))
+            max_slices[level] = {
+                "z": int(max_slice_z_index[0] * scale_factor),
+                "y": int(max_slice_y_index[0] * scale_factor),
+                "x": int(max_slice_x_index[0] * scale_factor)
+            }
+
+        # sort keys by int value
+        max_slices = dict(sorted(max_slices.items(), key=lambda item: int(item[0])))
+
+        return max_slices
+
+
+class PairedTiles:
+    """
+    Class to hold a pair of adjacent tiles and visualize their overlap in 3D.
+    
+    This class handles translation-only registration between tiles and provides 
+    methods to visualize slices through the composite volume in any orientation.
+    """
+    
+    def __init__(self, tile1, tile2, transform1, transform2, names=None, clip_percentiles=(1, 99)):
+        """
+        Initialize with two TileData objects and their transformation matrices.
+        
+        Args:
+            tile1: First TileData object
+            tile2: Second TileData object
+            transform1: 4x4 transformation matrix for tile1
+            transform2: 4x4 transformation matrix for tile2
+            names: Optional tuple of (name1, name2) for the tiles
+            clip_percentiles: Tuple of (min_percentile, max_percentile) for intensity clipping
+        """
+        self.tile1 = tile1
+        self.tile2 = tile2
+        self.transform1 = transform1.copy()
+        self.transform2 = transform2.copy()
+        
+        self.pyramid_level1 = tile1.pyramid_level
+        self.pyramid_level2 = tile2.pyramid_level
+        
+        self.shape1 = tile1.shape
+        self.shape2 = tile2.shape
+        
+        # Store tile names
+        if names is None:
+            self.name1, self.channel1 = tile1.tile_name
+            self.name2, self.channel2 = tile2.tile_name
+        else:
+            self.name1, self.name2 = names
+
+        self.clip_percentiles = clip_percentiles
+        
+        self._scale_transforms()
+        self._calculate_bounds()
+        self.load_data()
+    
+    def _scale_transforms(self):
+        """Scale the translation components of transforms based on pyramid level."""
+        scale_factor1 = 2**self.pyramid_level1
+        self.scaled_transform1 = self.transform1.copy()
+        self.scaled_transform1[:3, 3] = self.scaled_transform1[:3, 3] / scale_factor1
+        
+        scale_factor2 = 2**self.pyramid_level2
+        self.scaled_transform2 = self.transform2.copy()
+        self.scaled_transform2[:3, 3] = self.scaled_transform2[:3, 3] / scale_factor2
+        
+        self.scale_factor1 = scale_factor1
+        self.scale_factor2 = scale_factor2
+    
+    def _calculate_bounds(self):
+        """Calculate the global bounds for the composite volume."""
+        # For translation-only transforms, we need to find:
+        # 1. The minimum coordinates (for the origin of the composite array)
+        # 2. The maximum coordinates (to determine the size of the composite array)
+        
+        # Get corners of tile1 in global space
+        shape1_zyx = np.array(self.shape1)  # (z, y, x)
+        corners1 = np.array([
+            [0, 0, 0],  # origin
+            [shape1_zyx[0], 0, 0],  # max z
+            [0, shape1_zyx[1], 0],  # max y
+            [0, 0, shape1_zyx[2]],  # max x
+            [shape1_zyx[0], shape1_zyx[1], 0],  # max z, y
+            [shape1_zyx[0], 0, shape1_zyx[2]],  # max z, x
+            [0, shape1_zyx[1], shape1_zyx[2]],  # max y, x
+            [shape1_zyx[0], shape1_zyx[1], shape1_zyx[2]]  # max z, y, x
+        ])
+        
+        # Transform corners to global space (for translation only)
+        global_corners1 = corners1 + self.scaled_transform1[:3, 3]
+        
+        # Repeat for tile2
+        shape2_zyx = np.array(self.shape2)
+        corners2 = np.array([
+            [0, 0, 0],
+            [shape2_zyx[0], 0, 0],
+            [0, shape2_zyx[1], 0],
+            [0, 0, shape2_zyx[2]],
+            [shape2_zyx[0], shape2_zyx[1], 0],
+            [shape2_zyx[0], 0, shape2_zyx[2]],
+            [0, shape2_zyx[1], shape2_zyx[2]],
+            [shape2_zyx[0], shape2_zyx[1], shape2_zyx[2]]
+        ])
+        
+        global_corners2 = corners2 + self.scaled_transform2[:3, 3]
+        
+        # Combine all corners and find min/max
+        all_corners = np.vstack([global_corners1, global_corners2])
+        self.min_corner = np.floor(np.min(all_corners, axis=0)).astype(int)
+        self.max_corner = np.ceil(np.max(all_corners, axis=0)).astype(int)
+        
+        # Calculate composite shape
+        self.composite_shape = self.max_corner - self.min_corner
+        
+        # Calculate offsets for each tile in the composite array
+        self.offset1 = (self.scaled_transform1[:3, 3] - self.min_corner).astype(int)
+        self.offset2 = (self.scaled_transform2[:3, 3] - self.min_corner).astype(int)
+        
+        # Print some debug info
+        print(f"Composite shape: {self.composite_shape}")
+        print(f"Tile1 offset: {self.offset1}")
+        print(f"Tile2 offset: {self.offset2}")
+    
+    def load_data(self):
+        """Load and transform tile data into composite space with percentile clipping."""
+        composite_shape = tuple(self.composite_shape) + (3,)
+        self.composite = np.zeros(composite_shape, dtype=np.float32)
+        
+        
+        
+        data1 = self.tile1.data.copy() 
+        data2 = self.tile2.data.copy()
+        
+        print(f"Tile1 shape: {data1.shape}, non-zero pixels: {np.count_nonzero(data1)}")
+        print(f"Tile2 shape: {data2.shape}, non-zero pixels: {np.count_nonzero(data2)}")
+        
+        min_percentile, max_percentile = self.clip_percentiles
+        
+        # Clip and normalize tile1 data
+        if np.any(data1 > 0):
+            # non zero for min
+            p_min1 = np.percentile(data1[data1 > 0], min_percentile)
+            p_max1 = np.percentile(data1[data1 > 0], max_percentile)
+            print(f"Tile1 percentiles: {min_percentile}% = {p_min1}, {max_percentile}% = {p_max1}")
+            
+            data1_clipped = np.clip(data1, p_min1, p_max1)
+            
+            # normalize to [0, 1]
+            data1_norm = (data1_clipped - p_min1) / (p_max1 - p_min1) if p_max1 > p_min1 else np.zeros_like(data1_clipped)
+            print(f"Tile1 normalized range: {data1_norm.min()} to {data1_norm.max()}")
+        else:
+            data1_norm = np.zeros_like(data1, dtype=np.float32)
+            p_min1, p_max1 = 0, 0
+        
+        # Clip and normalize tile2 data
+        if np.any(data2 > 0):
+            p_min2 = np.percentile(data2[data2 > 0], min_percentile)
+            p_max2 = np.percentile(data2[data2 > 0], max_percentile)
+            print(f"Tile2 percentiles: {min_percentile}% = {p_min2}, {max_percentile}% = {p_max2}")
+            
+            data2_clipped = np.clip(data2, p_min2, p_max2)
+            
+            # Normalize to [0, 1]
+            data2_norm = (data2_clipped - p_min2) / (p_max2 - p_min2) if p_max2 > p_min2 else np.zeros_like(data2_clipped)
+            print(f"Tile2 normalized range: {data2_norm.min()} to {data2_norm.max()}")
+        else:
+            data2_norm = np.zeros_like(data2, dtype=np.float32)
+            p_min2, p_max2 = 0, 0
+        
+        self.percentile_values = {
+            'tile1': (p_min1, p_max1),
+            'tile2': (p_min2, p_max2)
+        }
+        
+        # put data into composite
+        z1, y1, x1 = data1.shape
+        oz1, oy1, ox1 = self.offset1
+        
+        print(f"Tile1 offset in composite: {self.offset1}")
+        print(f"Tile2 offset in composite: {self.offset2}")
+        
+        # Calculate the actual space available in the composite array
+        z1_space = min(z1, self.composite_shape[0] - oz1)
+        y1_space = min(y1, self.composite_shape[1] - oy1)
+        x1_space = min(x1, self.composite_shape[2] - ox1)
+        
+        if z1_space < z1 or y1_space < y1 or x1_space < x1:
+            print(f"Warning: Tile1 extends beyond composite bounds. Clipping tile data.")
+            print(f"Available space: {z1_space}, {y1_space}, {x1_space}")
+        
+        # Place tile1 data, clipping if necessary
+        self.composite[oz1:oz1+z1_space, oy1:oy1+y1_space, ox1:ox1+x1_space, 0] = \
+            data1_norm[:z1_space, :y1_space, :x1_space]
+        
+        # Tile2 goes into green channel
+        z2, y2, x2 = data2.shape
+        oz2, oy2, ox2 = self.offset2
+        
+        # Calculate the actual space available in the composite array
+        z2_space = min(z2, self.composite_shape[0] - oz2)
+        y2_space = min(y2, self.composite_shape[1] - oy2)
+        x2_space = min(x2, self.composite_shape[2] - ox2)
+        
+        if z2_space < z2 or y2_space < y2 or x2_space < x2:
+            print(f"Warning: Tile2 extends beyond composite bounds. Clipping tile data.")
+            print(f"Available space: {z2_space}, {y2_space}, {x2_space}")
+        
+        # Place tile2 data, clipping if necessary
+        self.composite[oz2:oz2+z2_space, oy2:oy2+y2_space, ox2:ox2+x2_space, 1] = \
+            data2_norm[:z2_space, :y2_space, :x2_space]
+
+        # print(f"Composite shape: {self.composite_shape}")
+        # # Rotate composite 90 degrees if height < width
+        # if self.composite_shape[1] < self.composite_shape[0]:
+        #     self.composite = np.rot90(self.composite, k=-1, axes=(0,1))
+        #     self.should_rotate = True
+        # else:
+        #     self.should_rotate = False
+        # Create overlap mask (where both tiles have data)
+        self.overlap_mask = (self.composite[..., 0] > 0) & (self.composite[..., 1] > 0)
+        # if self.should_rotate:
+        #     self.overlap_mask = np.rot90(self.overlap_mask, k=-1, axes=(0,1))
+        
+        overlap_volume = np.sum(self.overlap_mask)
+        total_volume = np.prod(self.composite_shape)
+        print(f"Overlap volume: {overlap_volume} voxels ({overlap_volume/total_volume:.2%} of composite)")
+        
+        print(f"Red channel (Tile1) max value in composite: {self.composite[..., 0].max()}")
+        print(f"Green channel (Tile2) max value in composite: {self.composite[..., 1].max()}")
+    
+    def get_slice(self, index, orientation='xy', overlap_only=False, padding=20):
+        """
+        Get a slice from the composite volume.
+        
+        Args:
+            index: Index along the slicing dimension
+            orientation: One of 'xy', 'zy', 'zx'
+            overlap_only: If True, show only the overlap region
+            padding: Number of pixels to pad around overlap region
+            
+        Returns:
+            RGB slice data
+        """
+        if orientation == 'xy':
+            if index >= self.composite_shape[2]:
+                raise IndexError(f"Z index {index} out of bounds (max {self.composite_shape[2]-1})")
+            slice_data = self.composite[:, :, index, :]
+            slice_mask = self.overlap_mask[:, :, index] if overlap_only else None
+            
+        elif orientation == 'zy':
+            if index >= self.composite_shape[0]:
+                raise IndexError(f"X index {index} out of bounds (max {self.composite_shape[0]-1})")
+            slice_data = self.composite[index, :, :, :]
+            slice_mask = self.overlap_mask[index, :, :] if overlap_only else None
+            
+        elif orientation == 'zx':
+            if index >= self.composite_shape[1]:
+                raise IndexError(f"Y index {index} out of bounds (max {self.composite_shape[1]-1})")
+            slice_data = self.composite[:, index, :, :]
+            slice_mask = self.overlap_mask[:, index, :] if overlap_only else None
+        
+        else:
+            raise ValueError(f"Unknown orientation: {orientation}. Use 'xy', 'zy', or 'zx'")
+        
+        # If overlap_only is True, find the overlap region and add padding
+        if overlap_only and slice_mask is not None:
+            # Find the bounds of overlap region
+            rows, cols = np.where(slice_mask)
+            if len(rows) > 0 and len(cols) > 0:
+                rmin, rmax = rows.min(), rows.max()
+                cmin, cmax = cols.min(), cols.max()
+                
+                # Add padding
+                rmin = max(0, rmin - padding)
+                rmax = min(slice_data.shape[0], rmax + padding)
+                cmin = max(0, cmin - padding)
+                cmax = min(slice_data.shape[1], cmax + padding)
+                
+                # Crop to padded overlap region
+                slice_data = slice_data[rmin:rmax+1, cmin:cmax+1]
+            else:
+                # No overlap found
+                slice_data = np.zeros((1, 1, 3))
+            
+        return slice_data
+
+    def visualize_slice(self, index, orientation='xy', overlap_only=False, ax=None, padding=20, rotate_z=True):
+        """
+        Visualize a slice from the composite volume.
+        Shows the overlap region with padding if overlap_only is True.
+        
+        Args:
+            index: Index along the slicing dimension
+            orientation: One of 'xy', 'zy', 'zx' (default 'xy')
+            overlap_only: If True, show only the overlap region
+            ax: Matplotlib axis to plot on
+            padding: Number of pixels to pad around overlap region
+            rotate_z: If True, display Z as the vertical axis in XZ and YZ views
+        """
+        slice_data = self.get_slice(index, orientation, overlap_only, padding=padding)
+        
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 8))
+        else:
+            fig = ax.figure
+        
+        # Rotate the slice if needed
+        if rotate_z and orientation in ['zx', 'zy']:
+            slice_data = np.rot90(slice_data,3)
+        
+        ax.imshow(slice_data)
+        
+        # Adjust axis labels based on rotation
+        if rotate_z:
+            axis_labels = {
+                'xy': ('Y', 'X', 'Z'),  # XY view unchanged
+                'zy': ('Z', 'Y', 'X'),  # YZ view becomes ZY
+                'zx': ('Z', 'X', 'Y')   # XZ view becomes ZX
+            }
+        else:
+            axis_labels = {
+                'xy': ('Y', 'X', 'Z'),
+                'zy': ('Y', 'Z', 'X'),
+                'zx': ('X', 'Z', 'Y')
+            }
+        
+        ylabel, xlabel, slice_dim = axis_labels[orientation]
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{orientation.upper()} slice at {slice_dim}={index}")
+        
+        return fig, ax
+
+    def visualize_orthogonal_views(self, z_slice=None, y_slice=None, x_slice=None, 
+                                 overlap_only=False, padding=20, rotate_z=True):
+        """
+        Visualize orthogonal views of the composite volume.
+        
+        Args:
+            z_slice, y_slice, x_slice: Slice indices
+            overlap_only: If True, show only the overlap region
+            padding: Number of pixels to pad around overlap region
+            rotate_z: If True, display Z as the vertical axis in XZ and YZ views
+        """
+        # Use middle slices by default
+        if x_slice is None:
+            x_slice = self.composite_shape[0] // 2
+        if y_slice is None:
+            y_slice = self.composite_shape[1] // 2 
+        if z_slice is None:
+            z_slice = self.composite_shape[2] // 2
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Plot views with padding
+        self.visualize_slice(z_slice, 'xy', overlap_only, axes[0], padding=padding, rotate_z=rotate_z)
+        self.visualize_slice(y_slice, 'zx', overlap_only, axes[1], padding=padding, rotate_z=rotate_z)
+        self.visualize_slice(x_slice, 'zy', overlap_only, axes[2], padding=padding, rotate_z=rotate_z)
+        
+        plt.suptitle(f"Orthogonal Views of Paired Tiles\n{self.name1} (red) and {self.name2} (green)", fontsize=16)
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.85)
+        
+        return fig, axes
+
+
