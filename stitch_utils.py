@@ -2574,6 +2574,8 @@ def visualize_tile_overlap(tile1: TileData, tile2: TileData,
     """
     Create an RGB visualization of overlapping regions between two tiles.
     Creates a composite image of just the overlap region plus padding.
+
+    Note: this is before PairedTiles class implemented
     """
     # Get overlap information
     overlap_info = analyze_tile_overlap(tile1, tile2, transform1, transform2, padding)
@@ -2728,12 +2730,12 @@ def plot_transformed_tiles(tile1: TileData, tile2: TileData,
     ax.scatter([center2[0]], [center2[1]], color='green', marker='x', s=100, label='Tile 2 Center')
     
     # Plot translation vectors
-    ax.arrow(center1[0], center1[1], 
-            transform1_scaled[0, 3], transform1_scaled[1, 3],
-            head_width=20, head_length=20, fc='red', ec='red', alpha=0.5)
-    ax.arrow(center2[0], center2[1],
-            transform2_scaled[0, 3], transform2_scaled[1, 3],
-            head_width=20, head_length=20, fc='green', ec='green', alpha=0.5)
+    # ax.arrow(center1[0], center1[1], 
+    #         transform1_scaled[0, 3], transform1_scaled[1, 3],
+    #         head_width=20, head_length=20, fc='red', ec='red', alpha=0.5)
+    # ax.arrow(center2[0], center2[1],
+    #         transform2_scaled[0, 3], transform2_scaled[1, 3],
+    #         head_width=20, head_length=20, fc='green', ec='green', alpha=0.5)
     
     # Calculate and plot overlap region if it exists
     bbox1 = np.array([[np.min(corners1[:, 0]), np.min(corners1[:, 1])],

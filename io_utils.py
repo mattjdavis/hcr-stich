@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 from ng_link import parsers
 from collections import defaultdict
 
+import stitch_utils
+import seaborn as sns
+
 
 def load_tile_data(tile_name: str, 
                   bucket_name: str, 
@@ -28,7 +31,7 @@ def download_stitch_xmls(dataset_list,
                         save_dir=None,
                         overwrite=False):
     s3 = boto3.client("s3")
-    bucket_name = "aind-opne-data"
+    bucket_name = "aind-open-data"
     xml_list = ["stitching_single_channel.xml", "stitching_spot_channels.xml"]
 
     xmls = {}
@@ -943,5 +946,253 @@ class PairedTiles:
         plt.subplots_adjust(top=0.85)
         
         return fig, axes
+
+
+def visualize_multichannel_paired_tiles(tile1_name, tile2_name, data, 
+                                      channels=['405', '488', '514', '561', '594', '638'],
+                                      pyramid_level=2, overlap_only=False, padding='auto', rotate_z=True):
+    """
+    Visualize orthogonal views for all channels of a pair of tiles.
+    
+    Args:
+        tile1_name: Name of first tile
+        tile2_name: Name of second tile
+        data: Parsed XML data
+        channels: List of channels to visualize
+        pyramid_level: Pyramid level to load
+        overlap_only: Whether to show only overlap regions
+        padding: Padding around overlap regions
+        rotate_z: Whether to rotate Z axis to vertical
+    """
+    sns.set_context("talk")
+    # Create figure with n_channels rows and 3 columns
+    n_channels = len(channels)
+    fig, axes = plt.subplots(n_channels, 3, figsize=(18, 10*n_channels))
+    
+    # Get tile IDs
+    tile1_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile1_name)]
+    tile2_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile2_name)]
+
+    # Get transforms
+    transform1 = data["net_transforms"][tile1_id]
+    transform2 = data["net_transforms"][tile2_id]
+
+    
+    parsed_name1, ch1 = stitch_utils.parse_tile_name(tile1_name)
+    parsed_name2, ch2 = stitch_utils.parse_tile_name(tile2_name)
+
+
+    if padding == 'auto':
+        padding = 16 * 2**(3-pyramid_level)
+    
+    # Function to replace channel in tile name
+    def replace_channel(tile_name, new_channel):
+        parts = tile_name.split('_ch_')
+        return f"{parts[0]}_ch_{new_channel}.zarr"
+    
+    # Process each channel
+    for i, channel in enumerate(channels):
+        # Replace channel in tile names
+        ch_tile1 = replace_channel(tile1_name, channel)
+        ch_tile2 = replace_channel(tile2_name, channel)
+
+        print(f"\nChannel {channel}\n----------")
+        print(f"Tile1: {ch_tile1}")
+        print(f"Tile2: {ch_tile2}")
+        
+        try:
+            # Create paired tiles for this channel
+            paired_tiles = PairedTiles(
+                tile1=TileData(ch_tile1, "aind-open-data", data["dataset_path"], pyramid_level).connect(),
+                tile2=TileData(ch_tile2, "aind-open-data", data["dataset_path"], pyramid_level).connect(),
+                transform1=transform1,
+                transform2=transform2,
+                names=(f"{ch_tile1} ({channel})", f"{ch_tile2} ({channel})")
+            )
+            
+            # Load the data
+            paired_tiles.load_data()
+            
+            # Get middle slices
+            z_slice = paired_tiles.composite_shape[2] // 2
+            y_slice = paired_tiles.composite_shape[1] // 2
+            x_slice = paired_tiles.composite_shape[0] // 2
+            
+            # Plot the three views
+            paired_tiles.visualize_slice(z_slice, 'xy', overlap_only, axes[i,0], padding=padding, rotate_z=rotate_z)
+            paired_tiles.visualize_slice(y_slice, 'zx', overlap_only, axes[i,1], padding=padding, rotate_z=rotate_z)
+            paired_tiles.visualize_slice(x_slice, 'zy', overlap_only, axes[i,2], padding=padding, rotate_z=rotate_z)
+            
+            # Make titles more compact
+            axes[i,0].set_title(f"XY@Z={z_slice}", pad=2)
+            
+            # Add clims above middle plot
+            red_min, red_max = paired_tiles.percentile_values['tile1']
+            green_min, green_max = paired_tiles.percentile_values['tile2']
+            clim_text = f"Ch {channel}\nRed min/max: {int(red_min)}-{int(red_max)}\nGreen min/max: {int(green_min)}-{int(green_max)}"
+            axes[i,1].set_title(f"{clim_text}\nZX@Y={y_slice}", pad=2)
+            
+            axes[i,2].set_title(f"ZY@X={x_slice}", pad=2)
+            # add channel name to left of XY plot
+            
+
+        except Exception as e:
+            print(f"Error processing channel {channel}: {str(e)}")
+            # show traceback
+            # Create empty plots for this row
+            # for j in range(3):
+            #     axes[i,j].imshow(np.zeros((100,100,3)))
+            #     axes[i,j].set_title(f"Channel {channel} - Error")
+    
+    #plt.suptitle(f"Orthogonal Views of Paired Tiles Across Channels\n{data['dataset_path']}\n{parsed_name1} and {parsed_name2}", fontsize=20)
+    plt.suptitle(f"{data['dataset_path']}\n{parsed_name1} and {parsed_name2}", fontsize=20)
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.95)
+
+    return fig, axes
+
+
+
+
+def visualize_paired_tiles(tile1_name, tile2_name, data, pyramid_level=1, 
+                           bucket_name='aind-open-data', overlap_only=False, padding='auto'):
+
+    # 20 is good for pyramid level 3, scale up for lower levels by factor of 4
+    if padding == 'auto':
+        padding = 16 * 2**(3-pyramid_level)
+    # Create TileData objects
+    tile1 = TileData(tile1_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+    tile2 = TileData(tile2_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+
+    # Get tile IDs
+    tile1_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile1_name)]
+    tile2_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile2_name)]
+
+    # Get transforms
+    transform1 = data["net_transforms"][tile1_id]
+    transform2 = data["net_transforms"][tile2_id]
+    
+    # Parse tile names for display
+    parsed_name1 = stitch_utils.parse_tile_name(tile1_name)
+    parsed_name2 = stitch_utils.parse_tile_name(tile2_name)
+    
+    # Create PairedTiles object
+    paired = PairedTiles(tile1, tile2, transform1, transform2, names=(parsed_name1, parsed_name2))
+    
+    # Visualize orthogonal views
+    fig, axes = paired.visualize_orthogonal_views(overlap_only=overlap_only, padding=padding)
+    
+    return paired, fig, axes
+
+def get_net_transforms(data, tile_name):
+    """
+    Get the net transforms for a pair of tiles from the data dictionary.
+    
+    Parameters:
+    -----------
+    data : dict
+        Dictionary containing dataset information including tile_names and net_transforms
+    tile_name : str
+        Name of the first tile
+
+        
+    Returns:
+    --------
+    transform - The net transform for the tile
+    """
+    # Get tile IDs
+    tile_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile_name)]
+
+    # Get transforms
+    transform = data["net_transforms"][tile_id]
+    
+    return transform
+
+def create_paired_tiles(data, tile1_name, tile2_name, bucket_name, pyramid_level=2):
+    """
+    Create a PairedTiles object from two tile names and a data dictionary.
+    
+    Parameters:
+    -----------
+    data : dict
+        Dictionary containing dataset information including tile_names, net_transforms, and dataset_path
+        From BigSticher parsed XML
+    tile1_name : str
+        Name of the first tile
+    tile2_name : str
+        Name of the second tile
+    bucket_name : str
+        Name of the S3 bucket
+    pyramid_level : int, optional
+        Pyramid level to use (default: 0)
+        
+    Returns:
+    --------
+    paired : io_utils.PairedTiles
+        PairedTiles object containing the two connected tiles with transforms
+    """
+    # Create TileData objects
+    tile1 = TileData(tile1_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+    tile2 = TileData(tile2_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+
+    # Get tile IDs and transforms
+    transform1 = get_net_transforms(data, tile1_name)
+    transform2 = get_net_transforms(data, tile2_name)
+    # Parse tile names for display
+    parsed_name1, ch1 = stitch_utils.parse_tile_name(tile1_name)
+    parsed_name2, ch2 = stitch_utils.parse_tile_name(tile2_name)
+
+    # Create PairedTiles object
+    paired = PairedTiles(tile1, tile2, transform1, transform2, names=(parsed_name1, parsed_name2))
+    
+    return paired
+
+
+
+def figure_tile_overlap_4_slices(tile1_name, tile2_name, data, pyramid_level=1, bucket_name='aind-open-data'):
+# Create TileData objects
+    tile1 = TileData(tile1_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+    tile2 = TileData(tile2_name, bucket_name, data["dataset_path"], pyramid_level=pyramid_level).connect()
+
+
+    # look up the values in data["tile_names"] to get the ids (which is the key)
+    tile1_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile1_name)]
+    tile2_id = list(data["tile_names"].keys())[list(data["tile_names"].values()).index(tile2_name)]
+
+    # Get transforms for the tiles
+    transform1 = data["net_transforms"][tile1_id]
+    transform2 = data["net_transforms"][tile2_id]
+
+    n_cols = 4
+    size = 10
+    fig, axes = plt.subplots(1, n_cols, figsize=(size,size), sharey=True, constrained_layout=True)
+    axes = axes.flatten()
+
+    # Calculate z-slices at 20%, 40%, 60%, and 80% through the z dimension
+    z_min = max(0, min(tile1.shape[0], tile2.shape[0]))
+    z_slices = [int(z_min * p) for p in [0.2, 0.4, 0.6, 0.8]]
+
+    for i, z_slice in enumerate(z_slices):
+        result = stitch_utils.visualize_tile_overlap(tile1, tile2, transform1, transform2, 
+                                                    z_slice=z_slice, padding=50) # 1=50, 2 = 30, 3 = 20
+        
+        # Check if overlap is longer in x than y and transpose if needed
+        composite = result['composite']
+        overlap_shape = composite.shape
+        if overlap_shape[1] > overlap_shape[0]:  # if width > height
+            # transpose, but leave 3 dims
+            composite = composite.transpose(1, 0, 2)
+        
+        axes[i].imshow(composite)
+        axes[i].set_title(f'Z={z_slice}')
+        axes[i].axis('on')
+    tile1_name, ch1 = stitch_utils.parse_tile_name(tile1.tile_name)
+    tile2_name, ch2 = stitch_utils.parse_tile_name(tile2.tile_name)
+    # add whitespace above title
+    plt.suptitle(f'Tile Overlap\nRed={tile1_name}, Green={tile2_name} Ch={ch1}', y=0.85)
+    plt.tight_layout()
+    #plt.subplots_adjust(top=0.8)
+    plt.show()
 
 
